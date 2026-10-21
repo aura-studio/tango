@@ -449,7 +449,7 @@ func (s *Store) isolate(ctx context.Context, collName string, poison []poisonDoc
 				"reason":     reason,
 				"bytes":      len(rendered),
 				"preview":    previewForLog(rendered, logPreviewBytes),
-			}).Error("bulk write: document permanently rejected; isolated to dead_letter (skipped, not retried)")
+			}).Error("bulk write: document skipped and isolated to dead_letter (not retried)")
 		}
 		docs = append(docs, bson.M{
 			"_quarantine_reason":     reason,
