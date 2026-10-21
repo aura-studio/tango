@@ -3,14 +3,19 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/aura-studio/tango/internal/logging"
 )
 
 // unitStore builds a Store pointed at an unreachable MongoDB so counter and
@@ -175,5 +180,115 @@ func TestQuarantine_PoisonedModelIsStorable(t *testing.T) {
 	}
 	if msg, _ := doc["_quarantine_message"].(string); !strings.Contains(msg, "Badly formed input data") {
 		t.Errorf("_quarantine_message = %q, want it to carry the server's reason", msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// log capture — the abandoned-dead-letter path persists nothing, so its log
+// lines ARE the record and have to be asserted on directly.
+// ---------------------------------------------------------------------------
+
+type captureHook struct {
+	mu      sync.Mutex
+	entries []logrus.Entry
+}
+
+func (c *captureHook) Levels() []logrus.Level { return logrus.AllLevels }
+
+func (c *captureHook) Fire(e *logrus.Entry) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := logrus.Entry{Level: e.Level, Message: e.Message, Data: logrus.Fields{}}
+	for k, v := range e.Data {
+		cp.Data[k] = v
+	}
+	c.entries = append(c.entries, cp)
+	return nil
+}
+
+func (c *captureHook) count(msgSubstr string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, e := range c.entries {
+		if strings.Contains(e.Message, msgSubstr) {
+			n++
+		}
+	}
+	return n
+}
+
+func installCapture(t *testing.T) *captureHook {
+	t.Helper()
+	c := &captureHook{}
+	l := logging.L()
+	old := logrus.LevelHooks{}
+	for lvl, hs := range l.Hooks {
+		old[lvl] = hs
+	}
+	l.AddHook(c)
+	t.Cleanup(func() { l.ReplaceHooks(old) })
+	return c
+}
+
+// TestGiveUp_DeadLetterAbandonLogsEveryLine pins that no abandoned dead letter
+// vanishes silently. On this path nothing is persisted anywhere — dead letters
+// are not re-sunk into their own collection, and the source files rotate away
+// within minutes — so the log line is the only surviving record. An earlier
+// revision capped this at maxDetailLogsPerBatch, which would have discarded 123
+// of a full 128-model batch with nothing but a counter to show for it.
+func TestGiveUp_DeadLetterAbandonLogsEveryLine(t *testing.T) {
+	st, cleanup := unitStore(t)
+	defer cleanup()
+	hook := installCapture(t)
+
+	const n = maxDetailLogsPerBatch * 4 // deliberately well over the isolate cap
+	models := make([]mongo.WriteModel, 0, n)
+	for i := 0; i < n; i++ {
+		models = append(models, DeadLetterModel(fmt.Sprintf(`{"i":%d}`, i), errors.New("parse")))
+	}
+	st.GiveUp(context.Background(), st.DeadLetterCollection(), models, "test")
+
+	if got := hook.count("dead-letter document abandoned"); got != n {
+		t.Errorf("logged %d abandoned dead letters, want %d — every line must survive in the log", got, n)
+	}
+	if got := st.Stats().TotalAbandoned(); got != int64(n) {
+		t.Errorf("TotalAbandoned = %d, want %d", got, n)
+	}
+	// The overflow summary must NOT fire here: nothing is being withheld, so
+	// claiming "further documents not logged individually" would be false.
+	if got := hook.count("not logged individually"); got != 0 {
+		t.Errorf("abandoned-dead-letter path emitted %d overflow summaries, want 0", got)
+	}
+}
+
+// TestIsolate_CapsDetailLogsButSummarises pins the other half of the logging
+// contract: when documents ARE persisted to dead_letter, per-document logging is
+// capped so an outage cannot emit thousands of lines — but the cap must be
+// announced, never silent.
+func TestIsolate_CapsDetailLogsButSummarises(t *testing.T) {
+	st, cleanup := unitStore(t)
+	defer cleanup()
+	hook := installCapture(t)
+
+	const n = maxDetailLogsPerBatch * 4
+	poison := make([]poisonDoc, 0, n)
+	for i := 0; i < n; i++ {
+		poison = append(poison, poisonDoc{
+			model:   DeadLetterModel(fmt.Sprintf(`{"i":%d}`, i), errors.New("parse")),
+			code:    2,
+			message: "BadValue",
+		})
+	}
+	st.quarantine(context.Background(), "event", poison)
+
+	if got := hook.count("document permanently rejected"); got != maxDetailLogsPerBatch {
+		t.Errorf("logged %d detail lines, want the cap %d", got, maxDetailLogsPerBatch)
+	}
+	if got := hook.count("not logged individually"); got != 1 {
+		t.Errorf("overflow summaries = %d, want exactly 1", got)
+	}
+	if got := st.Stats().TotalQuarantined(); got != int64(n) {
+		t.Errorf("TotalQuarantined = %d, want %d (the counter must count ALL of them, not just the logged ones)", got, n)
 	}
 }

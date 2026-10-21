@@ -589,8 +589,16 @@ worker 的批次走 background ctx 写完。`RunWorkers` 内 `wg.Wait()` 等所�
 
 **写失败的处理是"有界背压"，不是"永不丢弃"**：`flushBatch` 在写入失败时保留批次、每 `bulkRetryPause`(1s)
 重试一次，对上游施加背压；但背压被 `process.pipeline.maxStuckDuration`（默认 3m）封顶。超时后整批交给
-`Store.GiveUp`——尽力隔离进 `dead_letter`（计入 `total_abandoned`）、打 Error 日志并带数据预览——然后清空
-批次，worker 恢复读取。ctx 取消分支不变，仍保留批次等重启后从源头重读。
+`Store.GiveUp`（计入 `total_abandoned`）然后清空批次，worker 恢复读取。`GiveUp` 分两种情况，**这个区别很重要**：
+
+- 目标是 `user`/`event`：尽力隔离进 `dead_letter`（`_quarantine_reason = "abandoned: backpressure budget exhausted"`），
+  数据仍可事后回捞。
+- 目标**就是** `dead_letter`：**不落库**，只逐条打 Error 日志带数据预览。因为死信模型是 `InsertOneModel`、
+  不幂等，再往自己集合里写会与已部分落库的记录重复。这条路上日志是**唯一**留存，所以它刻意**不受**
+  `maxDetailLogsPerBatch`(5) 的截断限制（隔离路径才受限制，因为那里内容已经落库了），每条给
+  `abandonPreviewBytes`(2 KiB) 的预览。
+
+ctx 取消分支不变，仍保留批次等重启后从源头重读。
 
 之所以必须封顶：本节旧版声称背压期间"日志文件会在磁盘上堆积"、重启后重读所以不丢数据，**这个前提在生产
 部署上是假的**——源日志挂在 `emptyDir` 卷上，生产方约 90s 轮转、只保留 11 个文件，磁盘上任何时刻只有约
@@ -598,14 +606,32 @@ worker 的批次走 background ctx 写完。`RunWorkers` 内 `wg.Wait()` 等所�
 所以超过留存窗口的背压保不住旧数据，只会让新数据全部读不进来，净损失更大。3m 远长于 DocumentDB 故障切换、
 远短于留存窗口。
 
-**毒文档走另一条路，根本到不了这个上限**：`store.bulkWriteRetried` 把命令级拒绝（`mongo.CommandError` 且
-错误码不在瞬时白名单 `isTransientWriteCode` 内，例如 DocumentDB 的 `" Badly formed input data"`）与 too-large
-一起判为 `isUnwinnableError`，立刻以 `backoff.Permanent` 返回，由 `bulkWrite` 二分定位、收敛到单条时隔离进
-`dead_letter`（计入 `total_quarantined`）后返回 nil，worker 侧看不到错误。判据是**错误的形状**而非某条特定
-文本：只有服务器真的回了话才会产生 `CommandError`，因此连接失败/选主超时（`topology.ServerSelectionError`）
-与故障切换类错误码都仍走背压。凡写入 `dead_letter` 的字符串一律先过 `dao/store/sanitize.go`：按 rune 边界
-截断 → `strings.ToValidUTF8` → 把 C0 控制字节与 DEL 转成可读的 `\xNN` 转义。**控制字节转义是必需的那一步**：
-NUL 是合法 UTF-8，`ToValidUTF8` 对它无效，而它恰好是 BSON 字符串的终止符，服务器会以整命令级错误拒收。
+**毒文档走另一条路，根本到不了这个上限**：`store.bulkWriteRetried` 把 `isUnwinnableError`（= too-large 或
+`isPermanentCommandError`）立刻以 `backoff.Permanent` 返回，由 `bulkWrite` 二分定位、收敛到单条时隔离进
+`dead_letter`（计入 `total_quarantined`）后返回 nil，worker 侧看不到错误。
+
+`isPermanentCommandError` 有两道闸门，**第二道是允许名单而不是拒绝名单**，这个选择是刻意的：
+
+1. 必须先是 `mongo.CommandError`——只有服务器真的回了话才会产生它，连接失败/选主超时是
+   `topology.ServerSelectionError`（已用真客户端在 `TestIsUnwinnableError_RealOutageIsTransient` 里钉住）。
+2. 然后必须是**已知的数据缺陷**：码 `2` BadValue / `9` FailedToParse / `121` DocumentValidationFailure，
+   或者文本命中 DocumentDB 的 `"badly formed input data"`（大小写不敏感；`ce.Message` 与 `err.Error()` 都查，
+   因为 `wrapErrors` 会置 `wrappedMsgOnly`，让 `Error()` 渲染内层 `driver.Error` 的文本而非自身字段）。
+
+为什么不用"凡非瞬时码都算永久"：那会在**运维型故障**下销毁好数据。`13` Unauthorized 和 `18` AuthenticationFailed
+是命令级错误、且**不在** `isTransientWriteCode` 白名单里，而驱动确实会把它们变成 `mongo.CommandError`
+（`auth.Error` 实现了 `Unwrap`，`wrapErrors` 的 `errors.As(err, &driver.Error{})` 会穿透到内层带码错误再重新包装）。
+按拒绝名单判定，凭据失效时完好的 event/user 批次会被二分到底、逐条隔离，而旧行为是背压等待——运维修好凭据
+数据就继续流。未知码因此一律保持旧的背压行为；真正兜底的是层 3 的有界背压，所以这里激进没有收益。
+代价是：出现一种全新的毒文档时会先停 3m 再整批隔离（而不是当场二分跳过），这 3m 是有界、可告警、且数据被保留的。
+
+凡写入 `dead_letter` 的字符串一律先过 `dao/store/sanitize.go`：按 rune 边界截断 → `strings.ToValidUTF8` →
+把 C0 控制字节与 DEL 转成可读的 `\xNN` 转义。**控制字节转义是必需的那一步**：NUL 是合法 UTF-8，
+`ToValidUTF8` 对它无效，而它恰好是 BSON 字符串的终止符，服务器会以整命令级错误拒收。
+`maxDeadLetterLineBytes` 是 64 KiB（对齐 tailer scanner 的 64 KiB 初始缓冲；`DeadLetterCap` 128 × 64 KiB = 8 MiB，
+是 16 MiB 命令上限的一半）。这确实比旧行为（按 `source.tailer.maxLineBytes` 默认 10 MiB 原样存）存得少，
+是有意的取舍：源文件 15 分钟就轮转掉，死信是唯一副本，**能写进去的有界副本好过写不进去的完整副本**；
+且真超了也安全——超大批次会被二分、单条超大文档会被隔离，不会卡死。
 2026-10-19 的生产事故正是这条路径——两个分片各被 1–2 条毒行卡住约 50 小时。可观测性对应
 `report: periodic/cumulative stats` 里的 `interval_/total_quarantined`、`interval_/total_abandoned`、
 `interval_/total_retries`，以及重试日志新增的 `failures` / `stuck_for` 字段。

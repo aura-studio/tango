@@ -130,8 +130,12 @@ func TestIsPermanentCommandError(t *testing.T) {
 		{"BadValue 2", mongo.CommandError{Code: 2, Message: "invalid field name"}},
 		{"FailedToParse 9", mongo.CommandError{Code: 9, Message: "unknown field"}},
 		{"DocumentValidationFailure 121", mongo.CommandError{Code: 121, Message: "validation failed"}},
-		{"unknown code 99999", mongo.CommandError{Code: 99999, Message: "something new"}},
 		{"wrapped in another error", fmt.Errorf("bulk write: %w", mongo.CommandError{Code: 2, Message: "bad"})},
+		// DocumentDB's codeless malformed-input refusal, matched on text and
+		// also when it only survives inside the wrapped error's rendering.
+		{"codeless malformed input, wrapped", fmt.Errorf("bulk write: %w",
+			mongo.CommandError{Message: "Badly formed input data"})},
+		{"malformed input, mixed case", mongo.CommandError{Code: 0, Message: "BADLY FORMED INPUT DATA"}},
 	}
 	for _, tc := range permanent {
 		if !isPermanentCommandError(tc.err) {
@@ -142,12 +146,18 @@ func TestIsPermanentCommandError(t *testing.T) {
 		}
 	}
 
-	// A backend failover or throttle must keep its backpressure: classifying
-	// these as permanent would quarantine recoverable data during an outage.
+	// Operational refusals must keep their backpressure: classifying these as
+	// permanent would bisect and quarantine perfectly good event/user data during
+	// an outage that an operator is about to fix. 13/18 are the important ones —
+	// they are command-level errors and are NOT in isTransientWriteCode, and the
+	// driver really does surface them as mongo.CommandError (auth.Error
+	// implements Unwrap, so wrapErrors reaches the inner coded driver.Error).
 	transient := []struct {
 		name string
 		err  error
 	}{
+		{"Unauthorized 13", mongo.CommandError{Code: 13, Message: "not authorized on db to execute command"}},
+		{"AuthenticationFailed 18", mongo.CommandError{Code: 18, Message: "Authentication failed"}},
 		{"NotWritablePrimary 10107", mongo.CommandError{Code: 10107, Message: "not primary"}},
 		{"ShutdownInProgress 91", mongo.CommandError{Code: 91, Message: "shutting down"}},
 		{"InterruptedAtShutdown 11600", mongo.CommandError{Code: 11600, Message: "interrupted"}},
@@ -155,10 +165,14 @@ func TestIsPermanentCommandError(t *testing.T) {
 		{"NetworkTimeout 89", mongo.CommandError{Code: 89, Message: "timeout"}},
 		{"throttling 16500", mongo.CommandError{Code: 16500, Message: "rate limited"}},
 		{"WriteConcernFailed 64", mongo.CommandError{Code: 64, Message: "write concern"}},
+		// Unknown codes default to backpressure, not to destroying data. The
+		// pipeline's bounded-backpressure budget is what releases them.
+		{"unknown code 99999", mongo.CommandError{Code: 99999, Message: "something new"}},
+		{"codeless but unrelated text", mongo.CommandError{Code: 0, Message: "some other refusal"}},
 	}
 	for _, tc := range transient {
 		if isPermanentCommandError(tc.err) {
-			t.Errorf("%s: must NOT be permanent", tc.name)
+			t.Errorf("%s: must NOT be permanent (good data would be quarantined during an operational outage)", tc.name)
 		}
 		if isUnwinnableError(tc.err) {
 			t.Errorf("%s: must NOT be unwinnable", tc.name)

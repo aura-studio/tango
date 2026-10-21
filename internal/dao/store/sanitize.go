@@ -25,12 +25,22 @@ import (
 // control-byte mapping catches it.
 const (
 	// maxDeadLetterLineBytes caps the raw log line stored in a dead_letter
-	// document. The per-worker dead-letter batch is DeadLetterCap (default 128),
-	// so the worst-case command is ~2 MB — well under the 16 MB server limit,
-	// which also keeps a giant line from turning into a too-large rejection.
-	maxDeadLetterLineBytes = 16 * 1024
+	// document. It is sized against the server's 16 MiB command limit rather than
+	// against a guess about typical line length: the per-worker dead-letter batch
+	// is pipeline.Config.DeadLetterCap (default 128), so 128 x 64 KiB = 8 MiB,
+	// half the limit. It also matches the tailer scanner's initial 64 KiB buffer
+	// (tailer.go:439), i.e. the size the source itself treats as an ordinary line.
+	//
+	// This is a real reduction from the old behaviour, which stored the line
+	// verbatim up to source.tailer.maxLineBytes (default 10 MiB). It is accepted
+	// because the source files live on an emptyDir volume and rotate away in
+	// minutes, so a dead letter is the only surviving copy and a bounded one is
+	// better than an unwritable one — but the bound is deliberately generous, and
+	// exceeding it is safe anyway: an oversize batch is split and a lone oversize
+	// document is isolated (see bulkWrite), so it cannot wedge.
+	maxDeadLetterLineBytes = 64 * 1024
 
-	// quarantineModelBytes caps the rendered write model stored by quarantine.
+	// quarantineModelBytes caps the rendered write model stored by isolate.
 	quarantineModelBytes = 8 * 1024
 
 	// logPreviewBytes caps the inline data preview emitted alongside a
@@ -38,10 +48,20 @@ const (
 	// in CloudWatch without querying the database.
 	logPreviewBytes = 512
 
+	// abandonPreviewBytes is the per-document preview used when a batch of dead
+	// letters is abandoned. That log line is the ONLY surviving record of those
+	// lines — they are not re-sunk into dead_letter (non-idempotent inserts would
+	// duplicate) and the source files rotate away within minutes — so it gets a
+	// larger budget than the ordinary preview and, unlike isolate, is not capped
+	// to a handful of documents. See logAbandonedModels.
+	abandonPreviewBytes = 2 * 1024
+
 	// maxDetailLogsPerBatch caps how many documents of a rejected batch get an
-	// individual log line. A batch can hold up to MaxBatchSize models, and a
-	// backend outage that gives up on all of them must not emit thousands of log
-	// lines; the overflow is summarised instead.
+	// individual log line when the batch is being ISOLATED to dead_letter, where
+	// the full content is persisted anyway. A batch can hold up to MaxBatchSize
+	// models and a backend outage must not emit thousands of log lines; the
+	// overflow is summarised. This cap deliberately does NOT apply to the
+	// abandoned-dead-letter path, where the log is the only record.
 	maxDetailLogsPerBatch = 5
 
 	// truncatedMarker is appended by truncate when payload was cut.
