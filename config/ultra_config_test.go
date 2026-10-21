@@ -186,11 +186,14 @@ func TestUltraCFG5_EveryKnownKeyHasFlag(t *testing.T) {
 		"process.batchSize",
 		"process.pipeline.batchWorkers",
 		"process.pipeline.flushInterval",
-		// cfgsync
+		// cfgsync — note there is deliberately NO cfgsync.collection here: the
+		// central config collection became the hardcoded cfgsync.DefaultCollection
+		// constant and the key was removed outright (178245e), so an old config
+		// still setting it is silently ignored as an unknown key. See the NOTE in
+		// internal/cfgsync/config.go. Do not re-add it.
 		"cfgsync.enabled",
 		"cfgsync.backend",
 		"cfgsync.documentID",
-		"cfgsync.collection",
 		// role
 		"role.mode",
 		"role.gateway.addr",
