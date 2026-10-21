@@ -22,6 +22,12 @@ import (
 // than blocking ingestion indefinitely.
 const bulkRetryPause = 1 * time.Second
 
+// statementLogEvery is how often the retry log re-emits the rendered MongoDB
+// statement of the stuck batch's first model. With bulkRetryPause at 1s this is
+// once a minute: enough to identify the offending document from CloudWatch
+// without turning a stall into a firehose of near-duplicate lines.
+const statementLogEvery = 60
+
 // drainFlushTimeout bounds the final flush at shutdown: long enough to drain a
 // healthy backend, but capped so an unreachable MongoDB cannot hang shutdown
 // forever. On give-up the batch is left for re-read on the next start, never
@@ -224,14 +230,25 @@ func flushBatch(ctx context.Context, st *dao.Store,
 			if stuckSince.IsZero() {
 				stuckSince = time.Now()
 			}
-			// stuck_for and failures are what make a wedge visible: the 2026-10-19
-			// incident repeated this line ~35,000 times over two days and nothing
-			// in it said how long ingestion had been stopped.
-			logging.WithError(err).
-				WithField("collection", coll.Name()).
-				WithField("batch", b.Len()).
-				WithField("failures", failures).
-				WithField("stuck_for", time.Since(stuckSince).Round(time.Second)).
+			fields := logging.Fields{
+				"collection": coll.Name(),
+				"batch":      b.Len(),
+				"failures":   failures,
+				// stuck_for and failures are what make a wedge visible: the
+				// 2026-10-19 incident repeated this line ~35,000 times over two
+				// days and nothing in it said how long ingestion had been
+				// stopped, or which document was being refused.
+				"stuck_for": time.Since(stuckSince).Round(time.Second),
+			}
+			// Name the stuck document on the first failure and then once a minute
+			// (bulkRetryPause is 1s). Logging it on every retry would push ~500 B/s
+			// per stuck worker into CloudWatch and bury the very signal it exists
+			// to provide; the store's own "bulk write failed after retries" line
+			// carries it on every backoff exhaustion in the meantime.
+			if failures == 1 || failures%statementLogEvery == 0 {
+				fields["first_statement"] = st.RenderFirstModel(coll, b.Models)
+			}
+			logging.WithError(err).WithFields(fields).
 				Error("bulk write failed; retaining batch and retrying (pipeline backpressure)")
 		}
 		if ctx.Err() != nil {

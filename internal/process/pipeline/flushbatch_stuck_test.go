@@ -2,12 +2,16 @@ package pipeline
 
 import (
 	"context"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/aura-studio/tango/internal/dao/store"
+	"github.com/aura-studio/tango/internal/logging"
 )
 
 // These tests pin the bounded-backpressure contract that the 2026-10-19 incident
@@ -113,6 +117,84 @@ func TestFlushBatch_NegativeMaxStuckRetriesForever(t *testing.T) {
 	}
 }
 
+// TestFlushBatch_RetryLogNamesTheDocument pins the property the 2026-10-19
+// incident was missing: the line an operator actually watches during a stall must
+// say WHICH document is being refused. That incident repeated the retry line
+// ~35,000 times over two days and nothing in it named the data, so the cause
+// could not be identified from the logs at all.
+func TestFlushBatch_RetryLogNamesTheDocument(t *testing.T) {
+	st, cleanup := unreachableStore(t)
+	defer cleanup()
+	hook := installPipelineCapture(t)
+
+	b := stuckBatch(2)
+	stats := &writeErrStats{}
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		flushBatch(ctx, st, st.EventCollection(), b, stats, -1)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("flushBatch hung past the ctx deadline")
+	}
+
+	entries := hook.find("retaining batch and retrying")
+	if len(entries) == 0 {
+		t.Fatal("no retry log line was emitted")
+	}
+	first := entries[0]
+	stmt, ok := first.Data["first_statement"].(string)
+	if !ok {
+		t.Fatalf("first retry line has no first_statement field (have %v)", first.Data)
+	}
+	if !strings.Contains(stmt, "db.event.updateOne(") {
+		t.Errorf("first_statement is not a mongosh statement: %q", stmt)
+	}
+	if !strings.Contains(stmt, "stuck-") {
+		t.Errorf("first_statement does not identify the document: %q", stmt)
+	}
+	if strings.Contains(stmt, "0xc0") {
+		t.Errorf("first_statement leaks a Go pointer address: %q", stmt)
+	}
+	if strings.ContainsAny(stmt, "\n\r") {
+		t.Errorf("first_statement must be single-line for CloudWatch: %q", stmt)
+	}
+	// stuck_for and failures must be present so a reader knows how long ingestion
+	// has been stopped — the other half of what the incident lacked.
+	if _, has := first.Data["stuck_for"]; !has {
+		t.Errorf("retry line missing stuck_for (have %v)", first.Data)
+	}
+	if _, has := first.Data["failures"]; !has {
+		t.Errorf("retry line missing failures (have %v)", first.Data)
+	}
+
+	// The statement is throttled: only the first failure and every
+	// statementLogEvery-th one carry it, so a stall cannot become a firehose.
+	withStmt := 0
+	for _, e := range entries {
+		if _, has := e.Data["first_statement"]; has {
+			withStmt++
+		}
+	}
+	if withStmt != 1 {
+		t.Errorf("%d of %d retry lines carried first_statement, want exactly 1 (the first) within a %s window",
+			withStmt, len(entries), 2500*time.Millisecond)
+	}
+}
+
+func TestRenderFirstModel_EmptyBatchIsSafe(t *testing.T) {
+	st, cleanup := unreachableStore(t)
+	defer cleanup()
+	if got := st.RenderFirstModel(st.EventCollection(), nil); got != "<empty batch>" {
+		t.Errorf("empty batch rendered as %q, want a placeholder", got)
+	}
+}
+
 // TestFlushBatch_ZeroMaxStuckFallsBackToDefault guards the fail-safe: an unset
 // budget must mean "three minutes", not "give up immediately" and not "retry
 // forever". RunWorkers is exported and can be handed a Config that never went
@@ -149,4 +231,51 @@ func TestFlushBatch_ZeroMaxStuckFallsBackToDefault(t *testing.T) {
 	if got := st.Stats().TotalAbandoned(); got != 0 {
 		t.Errorf("TotalAbandoned = %d, want 0 before the default budget elapses", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// log capture — asserting on what a failure line actually says
+// ---------------------------------------------------------------------------
+
+type pipelineCapture struct {
+	mu      sync.Mutex
+	entries []logrus.Entry
+}
+
+func (c *pipelineCapture) Levels() []logrus.Level { return logrus.AllLevels }
+
+func (c *pipelineCapture) Fire(e *logrus.Entry) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := logrus.Entry{Level: e.Level, Message: e.Message, Data: logrus.Fields{}}
+	for k, v := range e.Data {
+		cp.Data[k] = v
+	}
+	c.entries = append(c.entries, cp)
+	return nil
+}
+
+func (c *pipelineCapture) find(msgSubstr string) []logrus.Entry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []logrus.Entry
+	for _, e := range c.entries {
+		if strings.Contains(e.Message, msgSubstr) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func installPipelineCapture(t *testing.T) *pipelineCapture {
+	t.Helper()
+	c := &pipelineCapture{}
+	l := logging.L()
+	old := logrus.LevelHooks{}
+	for lvl, hs := range l.Hooks {
+		old[lvl] = hs
+	}
+	l.AddHook(c)
+	t.Cleanup(func() { l.ReplaceHooks(old) })
+	return c
 }

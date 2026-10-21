@@ -5,7 +5,6 @@ package store
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -210,7 +209,16 @@ func (s *Store) bulkWriteRetried(ctx context.Context, coll *mongo.Collection, mo
 		// Only genuinely transient failures reach here. An unwinnable error was
 		// not retried to exhaustion and is reported by quarantine / GiveUp with
 		// the data preview, so a "failed after retries" line would mislead.
-		logging.WithError(err).WithField("collection", coll.Name()).
+		//
+		// first_statement names an actual document from the batch. Without it
+		// this line says only "something failed", which is what let the
+		// 2026-10-19 wedge run for two days with nobody able to say what was
+		// being refused. This path also covers the single and batch upload
+		// modes, which have no pipeline worker to report for them.
+		logging.WithError(err).
+			WithField("collection", coll.Name()).
+			WithField("batch", len(models)).
+			WithField("first_statement", firstModelPreview(coll.Name(), models, logPreviewBytes)).
 			Warn("bulk write failed after retries")
 	}
 	return err
@@ -492,15 +500,20 @@ func (s *Store) GiveUp(ctx context.Context, coll *mongo.Collection, models []mon
 func (s *Store) isolate(ctx context.Context, collName string, poison []poisonDoc, reason, detailMsg string, counter *atomic.Int64) {
 	docs := make([]any, 0, len(poison))
 	for i, p := range poison {
-		rendered := fmt.Sprintf("%+v", p.model)
+		// The write model is rendered as a mongosh statement rather than a Go
+		// %+v dump: see renderWriteModel. The field keeps its historical name
+		// "model" so the dead_letter schema does not change, but its content is
+		// now something an operator can paste back into a shell to reproduce the
+		// rejection.
+		statement := renderWriteModel(collName, p.model)
 		if i < maxDetailLogsPerBatch {
 			logging.WithFields(logging.Fields{
 				"collection": collName,
 				"code":       p.code,
 				"message":    previewForLog(p.message, logPreviewBytes),
 				"reason":     reason,
-				"bytes":      len(rendered),
-				"preview":    previewForLog(rendered, logPreviewBytes),
+				"bytes":      len(statement),
+				"statement":  previewForLog(statement, logPreviewBytes),
 			}).Error(detailMsg)
 		}
 		docs = append(docs, bson.M{
@@ -509,7 +522,7 @@ func (s *Store) isolate(ctx context.Context, collName string, poison []poisonDoc
 			"_quarantine_code":       p.code,
 			"_quarantine_message":    sanitizeForBSON(p.message, logPreviewBytes),
 			"_ts":                    time.Now().UnixNano(),
-			"model":                  sanitizeForBSON(rendered, quarantineModelBytes),
+			"model":                  sanitizeForBSON(statement, quarantineModelBytes),
 		})
 	}
 	logOverflow(collName, "rejected documents", len(poison))
@@ -537,9 +550,19 @@ func logAbandonedModels(collName string, models []mongo.WriteModel) {
 		logging.WithFields(logging.Fields{
 			"collection": collName,
 			"reason":     "abandoned",
-			"preview":    previewForLog(fmt.Sprintf("%+v", m), abandonPreviewBytes),
+			"statement":  previewForLog(renderWriteModel(collName, m), abandonPreviewBytes),
 		}).Error("bulk write: dead-letter document abandoned (not re-sunk into dead_letter; this log line is the only record)")
 	}
+}
+
+// RenderFirstModel renders the first model of a batch as a mongosh statement,
+// sanitized and capped for use as a single log field. It is exported so the
+// pipeline worker's retry log — which lives in another package and is the line
+// an operator actually watches during a stall — can name the document involved
+// instead of only reporting a collection and a batch size. An empty batch
+// renders as a placeholder rather than panicking.
+func (s *Store) RenderFirstModel(coll *mongo.Collection, models []mongo.WriteModel) string {
+	return firstModelPreview(coll.Name(), models, logPreviewBytes)
 }
 
 // logOverflow records that per-document logging was capped, so a reader of the

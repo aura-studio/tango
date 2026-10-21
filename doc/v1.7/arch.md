@@ -252,6 +252,7 @@ config           -> cfgtree + 各模块（仅用其 RegisterDefaults 注册键�
 | `dao/config.go` | `dao.Config`：聚合 `mongo.Config` + `store.Config` |
 | `dao/store/store.go` | `Store` + `store.Config`(MaxElapsedTime) + `WriteStats`(Retries/Quarantined/Abandoned) + `BulkWrite(Ordered)` + 集合访问器；写失败分类：`classifyBulkWriteError`（逐文档）/ `isTooLargeError` / `isPermanentCommandError`（命令级拒绝）/ `isUnwinnableError`，永久失败经 `quarantine`/`isolate` 落 `dead_letter`，`GiveUp` 供上游放弃整批 |
 | `dao/store/sanitize.go` | `sanitizeForBSON`/`previewForLog`/`truncate`/`escapeControl`：凡原始字节进 BSON 字符串前先按 rune 边界截断 + `ToValidUTF8` + C0/DEL 转 `\xNN` 转义（详见 §7.2.1） |
+| `dao/store/render.go` | `renderWriteModel`/`extJSON`/`writeOpts`/`firstModelPreview`：把写模型渲染成 mongosh 可重放语句（canonical Extended JSON，保 int64 精度），供失败日志与隔离记录使用；`Store.RenderFirstModel` 是给 pipeline worker 用的导出口 |
 | `dao/store/identity.go` | `IdentityResolver`：`#account_id`/`#distinct_id` → `#user_id` |
 | `dao/store/indexes.go` | `EnsureIndexes`：user/event/dead_letter/id_mapping 索引 |
 | `dao/store/writemodel.go` | 构建写模型与 dead-letter 模型（`_ts` 防回退）；`DeadLetterModel` 的 `line`/`error` 一律经 `sanitizeForBSON` |
@@ -635,6 +636,16 @@ ctx 取消分支不变，仍保留批次等重启后从源头重读。
 2026-10-19 的生产事故正是这条路径——两个分片各被 1–2 条毒行卡住约 50 小时。可观测性对应
 `report: periodic/cumulative stats` 里的 `interval_/total_quarantined`、`interval_/total_abandoned`、
 `interval_/total_retries`，以及重试日志新增的 `failures` / `stuck_for` 字段。
+
+**失败日志必须带上出错的写入语句**：`dao/store/render.go` 的 `renderWriteModel` 把写模型渲染成 mongosh 可直接
+重放的语句（`db.event.updateOne({...}, {...}, {"upsert":true})`），文档部分用 **canonical** Extended JSON——
+不能用 relaxed，因为 `_ts` 是 UnixNano 级 int64（~1.8e18）远超 2^53，relaxed 会渲染成裸数字、粘回 shell 会被
+当 double 解析而丢精度，"可重放"就成了假的。它取代了原先的 `fmt.Sprintf("%+v", model)`，后者输出的是 Go 字段名
+加指针地址（`Upsert:0xc000216100`），运维既看不懂也没法用。落点有四处：`bulkWriteRetried` 退避耗尽的 Warn
+（字段 `first_statement`，这一条同时覆盖 single/batch 模式，它们没有 pipeline worker 代为报告）、`flushBatch`
+的卡住 Error（同名字段，但**只在 `failures==1` 及每 `statementLogEvery`(60) 次**带，因为 `bulkRetryPause` 是 1s，
+每次都带等于每秒往 CloudWatch 灌 500B）、`isolate` 的逐条 Error（字段 `statement`）与落库的 `model` 字段、以及
+`logAbandonedModels`。渲染只发生在失败路径，成功路径每条文档都不付这个代价。
 
 #### 7.2.2 file 一次性导入的函数调用链（v1.6.0）
 

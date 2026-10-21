@@ -178,6 +178,18 @@ func TestQuarantine_PoisonedModelIsStorable(t *testing.T) {
 	if !strings.Contains(model, `\x00`) {
 		t.Errorf("quarantine.model lost the NUL diagnostic: %q", model)
 	}
+	// And it must be a replayable statement, not a Go struct dump. The old %+v
+	// rendering emitted field names and pointer addresses (Upsert:0xc000216100),
+	// which told an operator nothing they could act on.
+	if !strings.HasPrefix(model, "db.dead_letter.insertOne(") {
+		t.Errorf("quarantine.model is not a mongosh statement: %q", model)
+	}
+	if strings.Contains(model, "0xc0") {
+		t.Errorf("quarantine.model leaks a Go pointer address: %q", model)
+	}
+	if strings.Contains(model, "Document:") {
+		t.Errorf("quarantine.model still looks like a Go struct dump: %q", model)
+	}
 	if msg, _ := doc["_quarantine_message"].(string); !strings.Contains(msg, "Badly formed input data") {
 		t.Errorf("_quarantine_message = %q, want it to carry the server's reason", msg)
 	}
