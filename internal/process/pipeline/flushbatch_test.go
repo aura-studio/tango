@@ -46,6 +46,9 @@ func unreachableStore(t *testing.T) (*store.Store, func()) {
 // TestFlushBatch_RetainsBatchOnWriteFailure pins the B5 fix: a persistent write
 // failure must NOT drop the batch (the pre-fix code reset it unconditionally),
 // and flushBatch must stop retrying when ctx is done rather than hang forever.
+// maxStuck is negative here, i.e. the "retry forever" escape hatch, so this test
+// keeps asserting the unbounded-backpressure behaviour it was written for; the
+// bounded case lives in flushbatch_stuck_test.go.
 func TestFlushBatch_RetainsBatchOnWriteFailure(t *testing.T) {
 	st, cleanup := unreachableStore(t)
 	defer cleanup()
@@ -62,7 +65,7 @@ func TestFlushBatch_RetainsBatchOnWriteFailure(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		flushBatch(ctx, st, st.EventCollection(), b, stats)
+		flushBatch(ctx, st, st.EventCollection(), b, stats, -1)
 	}()
 
 	select {
@@ -89,7 +92,7 @@ func TestFlushBatch_EmptyIsNoop(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		flushBatch(context.Background(), st, st.EventCollection(), NewBatch(4), stats)
+		flushBatch(context.Background(), st, st.EventCollection(), NewBatch(4), stats, -1)
 	}()
 	select {
 	case <-done:

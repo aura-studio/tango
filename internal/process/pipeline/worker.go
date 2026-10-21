@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -16,7 +17,9 @@ import (
 // bulkRetryPause is the coarse cadence between whole-batch write retries while
 // MongoDB is unavailable. store.BulkWrite already does fine-grained exponential
 // backoff within each attempt (up to MaxElapsedTime); this outer pause keeps
-// re-trying the SAME batch — applying backpressure — instead of dropping it.
+// re-trying the SAME batch — applying backpressure — until it succeeds or
+// Config.MaxStuckDuration elapses, at which point flushBatch gives it up rather
+// than blocking ingestion indefinitely.
 const bulkRetryPause = 1 * time.Second
 
 // drainFlushTimeout bounds the final flush at shutdown: long enough to drain a
@@ -89,9 +92,9 @@ func worker(ctx context.Context, cfg *Config, st *dao.Store,
 	// the final state, and unordered writes let one benign duplicate-key skip not
 	// abort the rest of the batch.
 	flush := func(flushCtx context.Context) {
-		flushBatch(flushCtx, st, st.UserCollection(), userBatch, stats)
-		flushBatch(flushCtx, st, st.EventCollection(), eventBatch, stats)
-		flushBatch(flushCtx, st, st.DeadLetterCollection(), deadBatch, stats)
+		flushBatch(flushCtx, st, st.UserCollection(), userBatch, stats, cfg.MaxStuckDuration)
+		flushBatch(flushCtx, st, st.EventCollection(), eventBatch, stats, cfg.MaxStuckDuration)
+		flushBatch(flushCtx, st, st.DeadLetterCollection(), deadBatch, stats, cfg.MaxStuckDuration)
 		lastFlush = time.Now()
 	}
 
@@ -173,39 +176,79 @@ func worker(ctx context.Context, cfg *Config, st *dao.Store,
 }
 
 // flushBatch writes a batch to the given collection (unordered). On success the
-// batch is reset; on failure it is RETAINED and retried until the write succeeds
-// or ctx is done — it is never silently dropped. (The pre-fix code reset the
-// batch unconditionally, so a write that failed for longer than MaxElapsedTime
-// lost the whole batch with only a log line.) Blocking here applies backpressure
-// up the pipeline — the worker stops draining its channel, the dispatcher and
-// tailer block, and log files accumulate on disk — until MongoDB recovers. When
-// ctx is done (shutdown / drain deadline) the unwritten batch is left in place
-// rather than dropped: the next start re-reads the source from the head and the
-// write models dedup by #uuid / _ts, so no event is lost.
+// batch is reset.
+//
+// On failure the batch is retained and retried, which applies backpressure up the
+// pipeline: the worker stops draining its channel, and the dispatcher and tailer
+// block behind it. That backpressure is BOUNDED by maxStuck. Once the batch has
+// been failing for that long it is handed to Store.GiveUp — isolated into
+// dead_letter on a best-effort basis, counted in WriteStats.Abandoned, logged
+// with a data preview — and then reset so ingestion resumes. A negative maxStuck
+// retries forever, restoring the pre-fix behaviour; it exists only as an escape
+// hatch.
+//
+// The bound is not a compromise, it is the correct behaviour for this
+// deployment. The old comment here claimed that blocking causes "log files [to]
+// accumulate on disk" and that a restart re-reads them, so nothing is lost. That
+// is false as deployed: the source lives on an emptyDir volume and the producer
+// rotates files away after roughly fifteen minutes whether or not tango read
+// them. Holding a batch past that window therefore preserves nothing while
+// preventing every subsequent line from being read — strictly worse than
+// releasing it. Three minutes is far longer than a DocumentDB failover and far
+// shorter than the retention window.
+//
+// The ctx-done path is unchanged: at shutdown the batch is still retained rather
+// than dropped, because a restart inside the retention window does re-read from
+// the head and the write models dedup by #uuid / _ts.
 func flushBatch(ctx context.Context, st *dao.Store,
-	coll *mongo.Collection, b *Batch, stats core.StatsCollector,
+	coll *mongo.Collection, b *Batch, stats core.StatsCollector, maxStuck time.Duration,
 ) {
 	if b.Empty() {
 		return
 	}
+	// Fail safe on an unset budget: RunWorkers is exported and can be handed a
+	// Config that never went through ApplyDefaults, and losing the safety net
+	// silently is exactly how a wedge runs for two days unnoticed.
+	if maxStuck == 0 {
+		maxStuck = defaultMaxStuckDuration
+	}
+	var stuckSince time.Time
+	var failures int
 	for {
 		if err := st.BulkWrite(ctx, coll, b.Models); err == nil {
 			b.Reset()
 			return
 		} else {
+			failures++
 			stats.OnWriteError()
+			if stuckSince.IsZero() {
+				stuckSince = time.Now()
+			}
+			// stuck_for and failures are what make a wedge visible: the 2026-10-19
+			// incident repeated this line ~35,000 times over two days and nothing
+			// in it said how long ingestion had been stopped.
 			logging.WithError(err).
 				WithField("collection", coll.Name()).
 				WithField("batch", b.Len()).
+				WithField("failures", failures).
+				WithField("stuck_for", time.Since(stuckSince).Round(time.Second)).
 				Error("bulk write failed; retaining batch and retrying (pipeline backpressure)")
 		}
 		if ctx.Err() != nil {
 			// Shutdown / drain deadline reached while still failing. Do NOT drop:
 			// the retained lines are re-read from the source head on the next
-			// start (idempotent by #uuid / _ts).
+			// start (idempotent by #uuid / _ts), for as long as those files still
+			// exist on the shared volume.
 			logging.WithField("collection", coll.Name()).
 				WithField("batch", b.Len()).
 				Warn("bulk write still failing at shutdown; batch left for re-read on restart (not dropped)")
+			return
+		}
+		if maxStuck > 0 && time.Since(stuckSince) >= maxStuck {
+			st.GiveUp(ctx, coll, b.Models, fmt.Sprintf(
+				"batch stuck for %s (maxStuckDuration=%s)",
+				time.Since(stuckSince).Round(time.Second), maxStuck))
+			b.Reset()
 			return
 		}
 		select {

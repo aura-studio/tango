@@ -28,7 +28,30 @@ type Config struct {
 	ChannelBuffer int `mapstructure:"channelBuffer"`
 	// DeadLetterCap is the per-worker dead-letter batch capacity. Default 128.
 	DeadLetterCap int `mapstructure:"deadLetterCap"`
+	// MaxStuckDuration bounds how long a worker may hold a batch that keeps
+	// failing to write, applying backpressure, before it gives the batch up
+	// (isolated to dead_letter, counted in WriteStats.Abandoned) and resumes
+	// reading. Default 3m.
+	//
+	// The bound exists because the backpressure it replaces is not actually
+	// protective in this deployment: the source log files live on an emptyDir
+	// volume and the producer rotates them away after roughly fifteen minutes
+	// whether or not they were read. Holding a batch past that window preserves
+	// nothing — it only stops new data from being read while the old source is
+	// deleted underneath us. Three minutes is comfortably longer than a
+	// DocumentDB failover and comfortably shorter than the retention window.
+	//
+	// Zero means "use the default"; a negative value means "retry forever",
+	// which restores the pre-fix behaviour and is only an escape hatch.
+	MaxStuckDuration time.Duration `mapstructure:"maxStuckDuration"`
 }
+
+// defaultMaxStuckDuration is the backpressure budget applied when
+// Config.MaxStuckDuration is unset. It lives here rather than only in
+// ApplyDefaults so flushBatch can also fall back to it: RunWorkers is exported
+// and can be handed a hand-built Config that never went through ApplyDefaults,
+// and the safety net must not silently disappear in that case.
+const defaultMaxStuckDuration = 3 * time.Minute
 
 // Validate checks the explicit adaptive batch bounds are consistent with the
 // target batch size. A nil receiver is valid. Note ApplyDefaults clamps these,
@@ -57,6 +80,7 @@ func (c *Config) RegisterDefaults(set func(key string, value any), prefix string
 	set(prefix+".flushInterval", "0s")
 	set(prefix+".channelBuffer", 0)
 	set(prefix+".deadLetterCap", 0)
+	set(prefix+".maxStuckDuration", "0s")
 }
 
 // ApplyDefaults fills unset pipeline options and clamps explicit batch bounds.
@@ -78,6 +102,11 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.DeadLetterCap <= 0 {
 		c.DeadLetterCap = 128
+	}
+	// Only an unset (zero) value takes the default: a negative MaxStuckDuration
+	// is a deliberate "retry forever" escape hatch and must survive.
+	if c.MaxStuckDuration == 0 {
+		c.MaxStuckDuration = defaultMaxStuckDuration
 	}
 }
 
