@@ -43,6 +43,7 @@ func (c *Config) ApplyDefaults() {
 type WriteStats struct {
 	Retries     atomic.Int64 // total retry attempts across all bulk writes
 	Quarantined atomic.Int64 // documents permanently rejected and routed to dead_letter
+	Abandoned   atomic.Int64 // documents released without being written (see Store.GiveUp)
 }
 
 // TotalRetries returns the cumulative retry count.
@@ -51,6 +52,11 @@ func (s *WriteStats) TotalRetries() int64 { return s.Retries.Load() }
 // TotalQuarantined returns the cumulative count of permanently-rejected
 // documents routed to dead_letter (see Store.quarantine).
 func (s *WriteStats) TotalQuarantined() int64 { return s.Quarantined.Load() }
+
+// TotalAbandoned returns the cumulative count of documents released without
+// ever being written (see Store.GiveUp). Any non-zero value means data was
+// deliberately dropped to keep ingestion alive, and should be alerted on.
+func (s *WriteStats) TotalAbandoned() int64 { return s.Abandoned.Load() }
 
 // Store manages MongoDB collections for user, event, and dead-letter data.
 type Store struct {
@@ -104,30 +110,44 @@ func (s *Store) BulkWriteOrdered(ctx context.Context, coll *mongo.Collection, mo
 
 // bulkWrite writes models, retrying transient failures (backpressure) while
 // isolating PERMANENT failures so a single poison document can never wedge the
-// pipeline in an infinite retry:
+// pipeline in an infinite retry. Three shapes of permanence are recognised:
 //   - per-document rejections (a structurally-invalid doc the server will never
 //     accept) are quarantined to dead_letter — see bulkWriteRetried;
-//   - a "command too large" failure is split (a batch that is merely too big is
-//     written in halves) or, once irreducible to a single oversize document,
-//     quarantined.
+//   - a command-level rejection the server answered with a non-transient code
+//     ("command too large", DocumentDB's "Badly formed input data", ...) is
+//     split — the server applied nothing, so re-submitting each half is safe —
+//     and once irreducible to a single document, quarantined;
+//   - a batch of dead letters that is itself unwinnable is logged and released
+//     rather than split, because dead-letter models are non-idempotent inserts
+//     and re-sinking them into their own collection would duplicate.
 //
-// Connection / failover / write-concern errors carry no such permanence signal
-// and are retried, preserving the never-drop-recoverable-data backpressure.
+// Connection / failover / write-concern errors carry no permanence signal and
+// are retried, applying backpressure. That backpressure is deliberately bounded
+// upstream (see pipeline.Config.MaxStuckDuration and Store.GiveUp): the source
+// log files live on an emptyDir volume and rotate away in minutes, so holding a
+// batch indefinitely does not preserve data — it only stops new data from being
+// read while the old source is deleted underneath us.
 func (s *Store) bulkWrite(ctx context.Context, coll *mongo.Collection, models []mongo.WriteModel, ordered bool) error {
 	if len(models) == 0 {
 		return nil
 	}
 	err := s.bulkWriteRetried(ctx, coll, models, ordered)
-	if err == nil || !isTooLargeError(err) {
+	if err == nil || !isUnwinnableError(err) {
 		return err
 	}
 	if len(models) == 1 {
-		// A lone document over the server's size limit can never be written —
-		// quarantine it rather than retry the unwinnable command forever.
-		s.quarantine(ctx, coll.Name(), []poisonDoc{{model: models[0], code: 0, message: err.Error()}})
+		// A lone document the server will never accept — oversize or malformed.
+		// Quarantine it rather than retry the unwinnable command forever.
+		s.quarantine(ctx, coll.Name(), []poisonDoc{{model: models[0], code: commandCode(err), message: err.Error()}})
 		return nil
 	}
-	// The batch is merely too big for one command: split and write each half.
+	if coll.Name() == s.deadLetter.Name() {
+		s.GiveUp(ctx, coll, models, "dead_letter batch permanently rejected: "+err.Error())
+		return nil
+	}
+	// The batch contains something the server will never accept: split and write
+	// each half. event/user models are additionally idempotent (#uuid upsert with
+	// a _ts guard), so re-submitting a half cannot duplicate.
 	mid := len(models) / 2
 	if e := s.bulkWrite(ctx, coll, models[:mid], ordered); e != nil {
 		return e
@@ -136,9 +156,10 @@ func (s *Store) bulkWrite(ctx context.Context, coll *mongo.Collection, models []
 }
 
 // bulkWriteRetried performs the backoff-retried bulk write. Transient errors are
-// retried up to MaxElapsedTime; per-document poison is quarantined and dropped; a
-// too-large error is surfaced (as a backoff.Permanent) for bulkWrite to split or
-// quarantine.
+// retried up to MaxElapsedTime; per-document poison is quarantined and dropped;
+// an unwinnable command-level rejection (too large, or refused by the server for
+// a non-transient reason) is surfaced as a backoff.Permanent for bulkWrite to
+// split or quarantine.
 func (s *Store) bulkWriteRetried(ctx context.Context, coll *mongo.Collection, models []mongo.WriteModel, ordered bool) error {
 	var attempt int
 	op := func() error {
@@ -162,8 +183,12 @@ func (s *Store) bulkWriteRetried(ctx context.Context, coll *mongo.Collection, mo
 			}
 			return err // retry the transient remainder (backpressure)
 		}
-		if isTooLargeError(err) {
-			return backoff.Permanent(err) // permanent for this batch size; bulkWrite splits/quarantines
+		if isUnwinnableError(err) {
+			// The server answered and refused. Retrying the same bytes cannot
+			// succeed, so stop now instead of burning MaxElapsedTime; bulkWrite
+			// splits or quarantines. Surfacing it as backoff.Permanent is what
+			// keeps a malformed document from becoming an infinite stall.
+			return backoff.Permanent(err)
 		}
 		return err // transient / unclassified -> backoff retries (backpressure)
 	}
@@ -181,7 +206,10 @@ func (s *Store) bulkWriteRetried(ctx context.Context, coll *mongo.Collection, mo
 		s.stats.Retries.Add(int64(retries))
 	}
 
-	if err != nil && !isTooLargeError(err) {
+	if err != nil && !isUnwinnableError(err) {
+		// Only genuinely transient failures reach here. An unwinnable error was
+		// not retried to exhaustion and is reported by quarantine / GiveUp with
+		// the data preview, so a "failed after retries" line would mislead.
 		logging.WithError(err).WithField("collection", coll.Name()).
 			Warn("bulk write failed after retries")
 	}
@@ -305,33 +333,126 @@ func isTooLargeError(err error) bool {
 	return strings.Contains(msg, "exceeded maximum") || strings.Contains(msg, "too large")
 }
 
+// isPermanentCommandError reports whether the server answered the command and
+// refused it for a reason that retrying the same bytes can never fix.
+//
+// The criterion is the SHAPE of the error, not a particular message. A
+// mongo.CommandError only exists when the server sent back a command-error
+// response, so transport problems (connection refused, server-selection timeout,
+// a closed client) are not CommandErrors and keep their backpressure. Codes on
+// the transient table (failover, step-down, throttling, write-concern) are
+// excluded for the same reason.
+//
+// This is what the 2026-10-19 incident was missing: DocumentDB rejected a
+// dead_letter insert whose stored line carried a raw control byte, answering
+// with a CommandError whose Code is 0 and whose Name is empty (no codeName), so
+// it rendered as " Badly formed input data". It is neither a per-document
+// BulkWriteException nor too-large, so it fell through to the transient branch
+// and was retried forever, stalling ingestion on two shards for ~50h.
+func isPermanentCommandError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ce mongo.CommandError
+	if !errors.As(err, &ce) {
+		return false // no server response: keep applying backpressure
+	}
+	if isTooLargeError(err) {
+		return false // too-large owns the split-then-quarantine path
+	}
+	return !isTransientWriteCode(int(ce.Code))
+}
+
+// isUnwinnableError reports whether retrying this exact batch can never succeed,
+// so bulkWrite must split or release it instead of returning it as backpressure.
+func isUnwinnableError(err error) bool {
+	return isTooLargeError(err) || isPermanentCommandError(err)
+}
+
+// commandCode extracts the server error code from a command-level rejection, or
+// 0 when the error carries none. DocumentDB's "Badly formed input data" has
+// neither a code nor a codeName, so 0 is the expected value there.
+func commandCode(err error) int {
+	var ce mongo.CommandError
+	if errors.As(err, &ce) {
+		return int(ce.Code)
+	}
+	return 0
+}
+
 // quarantine records permanently-rejected write models in the dead_letter
 // collection so a poison document is neither lost nor able to wedge the pipeline.
-// The model is stored as a STRING, not nested BSON: the very thing that made it
-// unwritable (a $-prefixed / dotted field NAME) would otherwise make the
-// dead_letter write fail too — as a string value it is harmless. That string is
-// additionally passed through sanitizeForBSON: rendering a model with %+v
-// re-emits the raw bytes that got it rejected in the first place (a dead-letter
-// model carries the offending log line verbatim), so without cleaning the
-// quarantine write would be refused for the same reason and the evidence lost.
+func (s *Store) quarantine(ctx context.Context, collName string, poison []poisonDoc) {
+	s.isolate(ctx, collName, poison, "permanent bulk-write rejection", &s.stats.Quarantined)
+}
+
+// GiveUp releases a batch that could not be written and never will be, so that
+// holding on to it cannot stall ingestion. It is the store-side half of the
+// bounded-backpressure contract: the pipeline worker calls it once a batch has
+// been failing for longer than process.pipeline.maxStuckDuration, and bulkWrite
+// calls it for an unwinnable batch of dead letters.
+//
+// The batch is counted in TotalAbandoned and — except for dead_letter itself —
+// isolated into dead_letter on a best-effort basis. A batch that IS dead letters
+// is only logged, never re-written: dead-letter models are non-idempotent
+// inserts, so sinking them into their own collection again would duplicate.
+//
+// GiveUp never returns an error and never blocks beyond the bounded isolation
+// write. Quarantined and Abandoned count different reasons for the same sink, so
+// a document is never counted in both.
+func (s *Store) GiveUp(ctx context.Context, coll *mongo.Collection, models []mongo.WriteModel, reason string) {
+	if len(models) == 0 {
+		return
+	}
+	logging.WithFields(logging.Fields{
+		"collection": coll.Name(),
+		"batch":      len(models),
+		"reason":     previewForLog(reason, logPreviewBytes),
+	}).Error("bulk write: giving up on batch; documents skipped to keep ingestion running")
+
+	if coll.Name() == s.deadLetter.Name() {
+		s.stats.Abandoned.Add(int64(len(models)))
+		logAbandonedModels(coll.Name(), models)
+		return
+	}
+	poison := make([]poisonDoc, 0, len(models))
+	for _, m := range models {
+		poison = append(poison, poisonDoc{model: m, code: 0, message: reason})
+	}
+	// isolate owns the Abandoned increment, so GiveUp must not add to it here.
+	s.isolate(ctx, coll.Name(), poison, "abandoned: backpressure budget exhausted", &s.stats.Abandoned)
+}
+
+// isolate writes poison records into the dead_letter collection and logs them,
+// bumping counter. The model is stored as a STRING, not nested BSON: the very
+// thing that made it unwritable (a $-prefixed / dotted field NAME) would
+// otherwise make the dead_letter write fail too — as a string value it is
+// harmless. That string is additionally passed through sanitizeForBSON:
+// rendering a model with %+v re-emits the raw bytes that got it rejected in the
+// first place (a dead-letter model carries the offending log line verbatim), so
+// without cleaning the isolation write would be refused for the same reason and
+// the evidence lost.
+//
 // The write is best-effort on a fresh bounded context (so it runs even at
 // shutdown and cannot block): if dead_letter itself still rejects it, the error
-// is logged and the document dropped rather than retried, since the alternative
+// is logged and the documents dropped rather than retried, since the alternative
 // is the infinite stall this whole mechanism exists to remove.
-func (s *Store) quarantine(ctx context.Context, collName string, poison []poisonDoc) {
+func (s *Store) isolate(ctx context.Context, collName string, poison []poisonDoc, reason string, counter *atomic.Int64) {
 	docs := make([]any, 0, len(poison))
-	for _, p := range poison {
+	for i, p := range poison {
 		rendered := fmt.Sprintf("%+v", p.model)
-		logging.WithFields(logging.Fields{
-			"collection": collName,
-			"code":       p.code,
-			"message":    p.message,
-			"reason":     "permanent rejection",
-			"bytes":      len(rendered),
-			"preview":    previewForLog(rendered, logPreviewBytes),
-		}).Error("bulk write: document permanently rejected; quarantined to dead_letter (skipped, not retried)")
+		if i < maxDetailLogsPerBatch {
+			logging.WithFields(logging.Fields{
+				"collection": collName,
+				"code":       p.code,
+				"message":    previewForLog(p.message, logPreviewBytes),
+				"reason":     reason,
+				"bytes":      len(rendered),
+				"preview":    previewForLog(rendered, logPreviewBytes),
+			}).Error("bulk write: document permanently rejected; isolated to dead_letter (skipped, not retried)")
+		}
 		docs = append(docs, bson.M{
-			"_quarantine_reason":     "permanent bulk-write rejection",
+			"_quarantine_reason":     reason,
 			"_quarantine_collection": collName,
 			"_quarantine_code":       p.code,
 			"_quarantine_message":    sanitizeForBSON(p.message, logPreviewBytes),
@@ -339,12 +460,44 @@ func (s *Store) quarantine(ctx context.Context, collName string, poison []poison
 			"model":                  sanitizeForBSON(rendered, quarantineModelBytes),
 		})
 	}
-	s.stats.Quarantined.Add(int64(len(poison)))
+	logOverflow(collName, "rejected documents", len(poison))
+	counter.Add(int64(len(poison)))
 
 	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	if _, err := s.deadLetter.InsertMany(qctx, docs, options.InsertMany().SetOrdered(false)); err != nil {
 		logging.WithError(err).WithField("collection", collName).
-			Error("bulk write: failed to quarantine poison document(s) to dead_letter; dropping to avoid wedge")
+			Error("bulk write: failed to isolate poison document(s) to dead_letter; dropping to avoid wedge")
 	}
+}
+
+// logAbandonedModels emits a bounded number of data previews for documents being
+// dropped without being written anywhere, so the underlying data problem is
+// still diagnosable from the logs alone.
+func logAbandonedModels(collName string, models []mongo.WriteModel) {
+	n := len(models)
+	if n > maxDetailLogsPerBatch {
+		n = maxDetailLogsPerBatch
+	}
+	for _, m := range models[:n] {
+		logging.WithFields(logging.Fields{
+			"collection": collName,
+			"reason":     "abandoned",
+			"preview":    previewForLog(fmt.Sprintf("%+v", m), logPreviewBytes),
+		}).Error("bulk write: dead-letter document abandoned (not re-sunk into dead_letter)")
+	}
+	logOverflow(collName, "abandoned dead letters", len(models))
+}
+
+// logOverflow records that per-document logging was capped, so a reader of the
+// logs knows the batch was larger than the previews shown.
+func logOverflow(collName, what string, total int) {
+	if total <= maxDetailLogsPerBatch {
+		return
+	}
+	logging.WithFields(logging.Fields{
+		"collection": collName,
+		"total":      total,
+		"logged":     maxDetailLogsPerBatch,
+	}).Errorf("bulk write: %d further %s not logged individually", total-maxDetailLogsPerBatch, what)
 }

@@ -38,6 +38,12 @@ const (
 	// in CloudWatch without querying the database.
 	logPreviewBytes = 512
 
+	// maxDetailLogsPerBatch caps how many documents of a rejected batch get an
+	// individual log line. A batch can hold up to MaxBatchSize models, and a
+	// backend outage that gives up on all of them must not emit thousands of log
+	// lines; the overflow is summarised instead.
+	maxDetailLogsPerBatch = 5
+
 	// truncatedMarker is appended by truncate when payload was cut.
 	truncatedMarker = "...(truncated)"
 )
