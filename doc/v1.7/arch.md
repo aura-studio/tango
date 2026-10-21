@@ -250,10 +250,11 @@ config           -> cfgtree + 各模块（仅用其 RegisterDefaults 注册键�
 |---|---|
 | `dao/dao.go` | `Dao`：显式持有 `Mongo *mongo.MongoResource` + `Store *store.Store`；`New(res, cfg)` 装配 store；**store 门面**：`type Store = store.Store` 别名 + `UserWriteModel`/`EventWriteModel`/`EventWriteModelSkipExisting`/`DeadLetterModel` 重导出；**ejson 门面**：`type EJSONRequest/EJSONResponse = ejson.Request/Response` 别名 + `EJSONAction*` 常量 + `DecodeEJSONRequest` + `(*Dao).EJSON` 中转；**sql 门面**：`type SQLResult = sql.Result` 别名 + `(*Dao).SQL`（惰性 `sync.Once` 建 `*sql.Driver`）中转 |
 | `dao/config.go` | `dao.Config`：聚合 `mongo.Config` + `store.Config` |
-| `dao/store/store.go` | `Store` + `store.Config`(MaxElapsedTime) + `WriteStats` + `BulkWrite(Ordered)` + 集合访问器 |
+| `dao/store/store.go` | `Store` + `store.Config`(MaxElapsedTime) + `WriteStats`(Retries/Quarantined/Abandoned) + `BulkWrite(Ordered)` + 集合访问器；写失败分类：`classifyBulkWriteError`（逐文档）/ `isTooLargeError` / `isPermanentCommandError`（命令级拒绝）/ `isUnwinnableError`，永久失败经 `quarantine`/`isolate` 落 `dead_letter`，`GiveUp` 供上游放弃整批 |
+| `dao/store/sanitize.go` | `sanitizeForBSON`/`previewForLog`/`truncate`/`escapeControl`：凡原始字节进 BSON 字符串前先按 rune 边界截断 + `ToValidUTF8` + C0/DEL 转 `\xNN` 转义（详见 §7.2.1） |
 | `dao/store/identity.go` | `IdentityResolver`：`#account_id`/`#distinct_id` → `#user_id` |
 | `dao/store/indexes.go` | `EnsureIndexes`：user/event/dead_letter/id_mapping 索引 |
-| `dao/store/writemodel.go` | 构建写模型与 dead-letter 模型（`_ts` 防回退） |
+| `dao/store/writemodel.go` | 构建写模型与 dead-letter 模型（`_ts` 防回退）；`DeadLetterModel` 的 `line`/`error` 一律经 `sanitizeForBSON` |
 | `dao/mongo/mongo.go` | `MongoResource` + `ConnectMongo`/`Borrow`/`DatabaseFromClient`/`Close` |
 | `dao/mongo/config.go` | `mongo.Config`（URI + 连接超时）+ `MongoDBFromURI` |
 
@@ -585,6 +586,29 @@ daemon 是唯一长驻的 pipeline 角色，其上报路径的并发结构（`in
 这正是 fd 看门狗"优雅自重启"和 SIGTERM 优雅退出都不丢数据的根据——取消 `runCtx` 只停"读新行"，已 drain 进
 worker 的批次走 background ctx 写完。`RunWorkers` 内 `wg.Wait()` 等所有 worker 退出后才返回，`Service.Run`
 再 `<-reportDone` 等 stats reporter 退出、`logFinalStats` 打收尾摘要。
+
+**写失败的处理是"有界背压"，不是"永不丢弃"**：`flushBatch` 在写入失败时保留批次、每 `bulkRetryPause`(1s)
+重试一次，对上游施加背压；但背压被 `process.pipeline.maxStuckDuration`（默认 3m）封顶。超时后整批交给
+`Store.GiveUp`——尽力隔离进 `dead_letter`（计入 `total_abandoned`）、打 Error 日志并带数据预览——然后清空
+批次，worker 恢复读取。ctx 取消分支不变，仍保留批次等重启后从源头重读。
+
+之所以必须封顶：本节旧版声称背压期间"日志文件会在磁盘上堆积"、重启后重读所以不丢数据，**这个前提在生产
+部署上是假的**——源日志挂在 `emptyDir` 卷上，生产方约 90s 轮转、只保留 11 个文件，磁盘上任何时刻只有约
+15 分钟的数据；tailer 被堵住时文件照样被删（日志里持续打 `tailer: file gone, stopping tail and releasing fd`）。
+所以超过留存窗口的背压保不住旧数据，只会让新数据全部读不进来，净损失更大。3m 远长于 DocumentDB 故障切换、
+远短于留存窗口。
+
+**毒文档走另一条路，根本到不了这个上限**：`store.bulkWriteRetried` 把命令级拒绝（`mongo.CommandError` 且
+错误码不在瞬时白名单 `isTransientWriteCode` 内，例如 DocumentDB 的 `" Badly formed input data"`）与 too-large
+一起判为 `isUnwinnableError`，立刻以 `backoff.Permanent` 返回，由 `bulkWrite` 二分定位、收敛到单条时隔离进
+`dead_letter`（计入 `total_quarantined`）后返回 nil，worker 侧看不到错误。判据是**错误的形状**而非某条特定
+文本：只有服务器真的回了话才会产生 `CommandError`，因此连接失败/选主超时（`topology.ServerSelectionError`）
+与故障切换类错误码都仍走背压。凡写入 `dead_letter` 的字符串一律先过 `dao/store/sanitize.go`：按 rune 边界
+截断 → `strings.ToValidUTF8` → 把 C0 控制字节与 DEL 转成可读的 `\xNN` 转义。**控制字节转义是必需的那一步**：
+NUL 是合法 UTF-8，`ToValidUTF8` 对它无效，而它恰好是 BSON 字符串的终止符，服务器会以整命令级错误拒收。
+2026-10-19 的生产事故正是这条路径——两个分片各被 1–2 条毒行卡住约 50 小时。可观测性对应
+`report: periodic/cumulative stats` 里的 `interval_/total_quarantined`、`interval_/total_abandoned`、
+`interval_/total_retries`，以及重试日志新增的 `failures` / `stuck_for` 字段。
 
 #### 7.2.2 file 一次性导入的函数调用链（v1.6.0）
 

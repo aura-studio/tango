@@ -321,6 +321,7 @@ mongodb://user:pass@<cluster-endpoint>:27017/tango?tls=true&tlsCAFile=/path/glob
 | `process.pipeline.flushInterval` | optional | `1s` | 未满批次刷新间隔 |
 | `process.pipeline.channelBuffer` | optional | `0`(自动 = batchSize*2) | 每 worker 通道缓冲 |
 | `process.pipeline.deadLetterCap` | optional | `128` | 每 worker 死信批容量 |
+| `process.pipeline.maxStuckDuration` | optional | `3m` | 一批写入持续失败时允许施加背压的最长时长。超时后该批交给 `Store.GiveUp`：尽力隔离进 `dead_letter`、计入 `total_abandoned`、打 Error 日志，然后清空批次让管道继续读取。`0`/未设置 = 取默认（`flushBatch` 内部也会兜底，防止绕过 `ApplyDefaults` 时保险丝失效）；负值 = 无限重试（旧行为，仅作逃生阀）。**必须有界**：源日志挂在 `emptyDir` 上、约 15 分钟就被生产方轮转删除，超过该窗口的背压保不住旧数据，只会让新数据全部读不进来。3m 远长于 DocumentDB 故障切换、远短于留存窗口 |
 
 ### cfgsync（daemon / gateway） → `internal/cfgsync`
 
@@ -456,6 +457,7 @@ gateway 同时暴露三个独立路径（与 `/upload` 互不影响，无额外�
 | `process.pipeline.flushInterval` | `1s` | `internal/process/pipeline` |
 | `process.pipeline.channelBuffer` | `0`(自动 = batchSize*2) | `internal/process/pipeline` |
 | `process.pipeline.deadLetterCap` | `128` | `internal/process/pipeline` |
+| `process.pipeline.maxStuckDuration` | `3m`（`0` = 取默认，负值 = 无限背压） | `internal/process/pipeline` |
 | `cfgsync.enabled` | `false` | `internal/cfgsync` |
 | `cfgsync.backend` | `poll` | `internal/cfgsync` |
 | `cfgsync.documentID` | `filter` | `internal/cfgsync` |

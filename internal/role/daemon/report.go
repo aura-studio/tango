@@ -221,6 +221,11 @@ func (d *Service) reportStats(ctx context.Context, tailerSrc source.Source, stat
 	defer ticker.Stop()
 
 	var prev process.Snapshot
+	// Store-level counters are read straight off the store rather than plumbed
+	// through core.StatsCollector: they are cumulative atomics owned by the store,
+	// and growing that interface would force a change in all five of its
+	// implementations (including three test fakes) for no benefit.
+	var prevQuarantined, prevAbandoned, prevRetries int64
 
 	for {
 		select {
@@ -231,18 +236,26 @@ func (d *Service) reportStats(ctx context.Context, tailerSrc source.Source, stat
 
 			uptime := time.Since(startTime).Round(time.Second)
 
+			ws := d.dao.Store.Stats()
+			quarantined := ws.TotalQuarantined()
+			abandoned := ws.TotalAbandoned()
+			retries := ws.TotalRetries()
+
 			logging.WithFields(logging.Fields{
-				"uptime":                uptime,
-				"interval_lines":        cur.TotalLines - prev.TotalLines,
-				"interval_parsed_ok":    cur.ParsedOK - prev.ParsedOK,
-				"interval_parse_err":    cur.ParseErrors - prev.ParseErrors,
-				"interval_identity_err": cur.IdentityErrors - prev.IdentityErrors,
-				"interval_user_writes":  cur.UserWrites - prev.UserWrites,
-				"interval_event_writes": cur.EventWrites - prev.EventWrites,
-				"interval_dead_letters": cur.DeadLetters - prev.DeadLetters,
-				"interval_write_err":    cur.WriteErrors - prev.WriteErrors,
-				"interval_filtered":     cur.Filtered - prev.Filtered,
-				"interval_filter_err":   cur.FilterErrors - prev.FilterErrors,
+				"uptime":                 uptime,
+				"interval_lines":         cur.TotalLines - prev.TotalLines,
+				"interval_parsed_ok":     cur.ParsedOK - prev.ParsedOK,
+				"interval_parse_err":     cur.ParseErrors - prev.ParseErrors,
+				"interval_identity_err":  cur.IdentityErrors - prev.IdentityErrors,
+				"interval_user_writes":   cur.UserWrites - prev.UserWrites,
+				"interval_event_writes":  cur.EventWrites - prev.EventWrites,
+				"interval_dead_letters":  cur.DeadLetters - prev.DeadLetters,
+				"interval_write_err":     cur.WriteErrors - prev.WriteErrors,
+				"interval_filtered":      cur.Filtered - prev.Filtered,
+				"interval_filter_err":    cur.FilterErrors - prev.FilterErrors,
+				"interval_quarantined": quarantined - prevQuarantined,
+				"interval_abandoned":   abandoned - prevAbandoned,
+				"interval_retries":     retries - prevRetries,
 			}).Info("report: periodic stats (last 60s)")
 
 			logging.WithFields(logging.Fields{
@@ -256,6 +269,9 @@ func (d *Service) reportStats(ctx context.Context, tailerSrc source.Source, stat
 				"total_write_err":    cur.WriteErrors,
 				"total_filtered":     cur.Filtered,
 				"total_filter_err":   cur.FilterErrors,
+				"total_quarantined":  quarantined,
+				"total_abandoned":    abandoned,
+				"total_retries":      retries,
 			}).Info("report: cumulative stats")
 
 			// Runtime / resource stats. open_fds is -1 on non-Linux (and the
@@ -286,6 +302,7 @@ func (d *Service) reportStats(ctx context.Context, tailerSrc source.Source, stat
 			}
 
 			prev = cur
+			prevQuarantined, prevAbandoned, prevRetries = quarantined, abandoned, retries
 		}
 	}
 }
@@ -295,6 +312,10 @@ func (d *Service) logFinalStats(stats *process.Counters, startTime time.Time) {
 	cur := stats.Snapshot()
 
 	duration := time.Since(startTime).Round(time.Second)
+
+	ws := d.dao.Store.Stats()
+	quarantined := ws.TotalQuarantined()
+	abandoned := ws.TotalAbandoned()
 
 	logging.Info("report: ========== shutdown summary ==========")
 	logging.WithFields(logging.Fields{
@@ -308,7 +329,9 @@ func (d *Service) logFinalStats(stats *process.Counters, startTime time.Time) {
 		"total_write_errors": cur.WriteErrors,
 		"total_filtered":     cur.Filtered,
 		"total_filter_err":   cur.FilterErrors,
-		"total_retries":      d.dao.Store.Stats().TotalRetries(),
+		"total_quarantined":  quarantined,
+		"total_abandoned":    abandoned,
+		"total_retries":      ws.TotalRetries(),
 		"uptime":             duration,
 	}).Info("report: final stats")
 
@@ -317,7 +340,10 @@ func (d *Service) logFinalStats(stats *process.Counters, startTime time.Time) {
 		logging.WithField("lines_per_second", fmt.Sprintf("%.1f", lps)).Info("report: average throughput")
 	}
 
-	if cur.ParseErrors > 0 || cur.IdentityErrors > 0 || cur.WriteErrors > 0 {
+	// Quarantined and abandoned documents are data the server refused or data we
+	// released to protect ingestion; either means the run was not clean even when
+	// no write error is currently outstanding.
+	if cur.ParseErrors > 0 || cur.IdentityErrors > 0 || cur.WriteErrors > 0 || quarantined > 0 || abandoned > 0 {
 		logging.Warn("report: ========== SHUTDOWN WITH ERRORS ==========")
 	} else {
 		logging.Info("report: ========== SHUTDOWN COMPLETE ==========")
