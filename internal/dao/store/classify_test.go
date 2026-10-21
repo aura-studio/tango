@@ -96,12 +96,3 @@ func TestIsTooLargeError(t *testing.T) {
 		t.Error("nil should not be too-large")
 	}
 }
-
-func TestTruncate(t *testing.T) {
-	if got := truncate("hello", 10); got != "hello" {
-		t.Errorf("short string changed: %q", got)
-	}
-	if got := truncate("0123456789abc", 5); got != "01234...(truncated)" {
-		t.Errorf("truncate = %q", got)
-	}
-}

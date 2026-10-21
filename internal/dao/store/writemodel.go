@@ -258,6 +258,16 @@ func EventWriteModel(typ, uuid string, doc bson.M) mongo.WriteModel {
 // ---------------------------------------------------------------------------
 
 // DeadLetterModel creates an insert model for a failed log line.
+//
+// Both stored strings are sanitized. `line` is the raw scanner output and is
+// the reason this matters: a line carrying a NUL byte or invalid UTF-8 parses
+// into a Go string unchanged, the bson encoder writes it unchanged, and the
+// server then rejects the entire insert command (" Badly formed input data") —
+// a command-level rejection with no per-document detail, which used to be
+// retried forever and stalled ingestion. Cleaning here makes the dead letter
+// writable, so the bad data is preserved for inspection instead of wedging the
+// pipeline. Control bytes are rendered as readable `\xNN` escapes rather than
+// dropped, so the diagnosis survives.
 func DeadLetterModel(line string, parseErr error) mongo.WriteModel {
 	errMsg := ""
 	if parseErr != nil {
@@ -265,8 +275,8 @@ func DeadLetterModel(line string, parseErr error) mongo.WriteModel {
 	}
 	doc := bson.M{
 		"_ts":   time.Now().UnixNano(),
-		"line":  line,
-		"error": errMsg,
+		"line":  sanitizeForBSON(line, maxDeadLetterLineBytes),
+		"error": sanitizeForBSON(errMsg, logPreviewBytes),
 	}
 	return mongo.NewInsertOneModel().SetDocument(doc)
 }

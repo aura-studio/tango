@@ -305,38 +305,38 @@ func isTooLargeError(err error) bool {
 	return strings.Contains(msg, "exceeded maximum") || strings.Contains(msg, "too large")
 }
 
-// truncate caps s to at most n bytes (with an ellipsis marker) so a giant
-// document rendered for quarantine cannot itself exceed the dead_letter write
-// size limit.
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "...(truncated)"
-}
-
 // quarantine records permanently-rejected write models in the dead_letter
 // collection so a poison document is neither lost nor able to wedge the pipeline.
 // The model is stored as a STRING, not nested BSON: the very thing that made it
 // unwritable (a $-prefixed / dotted field NAME) would otherwise make the
-// dead_letter write fail too — as a string value it is harmless. The write is
-// best-effort on a fresh bounded context (so it runs even at shutdown and cannot
-// block): if dead_letter itself rejects it, the error is logged and the document
-// dropped rather than retried, since the alternative is the infinite stall this
-// whole mechanism exists to remove.
+// dead_letter write fail too — as a string value it is harmless. That string is
+// additionally passed through sanitizeForBSON: rendering a model with %+v
+// re-emits the raw bytes that got it rejected in the first place (a dead-letter
+// model carries the offending log line verbatim), so without cleaning the
+// quarantine write would be refused for the same reason and the evidence lost.
+// The write is best-effort on a fresh bounded context (so it runs even at
+// shutdown and cannot block): if dead_letter itself still rejects it, the error
+// is logged and the document dropped rather than retried, since the alternative
+// is the infinite stall this whole mechanism exists to remove.
 func (s *Store) quarantine(ctx context.Context, collName string, poison []poisonDoc) {
 	docs := make([]any, 0, len(poison))
 	for _, p := range poison {
+		rendered := fmt.Sprintf("%+v", p.model)
 		logging.WithFields(logging.Fields{
-			"collection": collName, "code": p.code, "message": p.message,
-		}).Error("bulk write: document permanently rejected; quarantined to dead_letter (not retried)")
+			"collection": collName,
+			"code":       p.code,
+			"message":    p.message,
+			"reason":     "permanent rejection",
+			"bytes":      len(rendered),
+			"preview":    previewForLog(rendered, logPreviewBytes),
+		}).Error("bulk write: document permanently rejected; quarantined to dead_letter (skipped, not retried)")
 		docs = append(docs, bson.M{
 			"_quarantine_reason":     "permanent bulk-write rejection",
 			"_quarantine_collection": collName,
 			"_quarantine_code":       p.code,
-			"_quarantine_message":    p.message,
+			"_quarantine_message":    sanitizeForBSON(p.message, logPreviewBytes),
 			"_ts":                    time.Now().UnixNano(),
-			"model":                  truncate(fmt.Sprintf("%+v", p.model), 8192),
+			"model":                  sanitizeForBSON(rendered, quarantineModelBytes),
 		})
 	}
 	s.stats.Quarantined.Add(int64(len(poison)))
