@@ -253,10 +253,10 @@ config           -> cfgtree + 各模块（仅用其 RegisterDefaults 注册键�
 | `dao/config.go` | `dao.Config`：聚合 `mongo.Config` + `store.Config` |
 | `dao/store/store.go` | `Store` + `store.Config`(MaxElapsedTime) + `WriteStats`(Retries/Quarantined/Abandoned) + `BulkWrite(Ordered)` + 集合访问器；写失败分类：`classifyBulkWriteError`（逐文档）/ `isTooLargeError` / `isPermanentCommandError`（命令级拒绝）/ `isUnwinnableError`，永久失败经 `quarantine`/`isolate` 落 `dead_letter`，`GiveUp` 供上游放弃整批 |
 | `dao/store/sanitize.go` | `sanitizeForBSON`/`previewForLog`/`truncate`/`escapeControl`：凡原始字节进 BSON 字符串前先按 rune 边界截断 + `ToValidUTF8` + C0/DEL 转 `\xNN` 转义（详见 §7.2.1） |
-| `dao/store/render.go` | `renderWriteModel`/`extJSON`/`writeOpts`/`firstModelPreview`：把写模型渲染成 mongosh 可重放语句（canonical Extended JSON，保 int64 精度），供失败日志与隔离记录使用；`Store.RenderFirstModel` 是给 pipeline worker 用的导出口 |
+| `dao/store/render.go` | `renderWriteModel`/`extJSON`/`sortedJSON`/`writeOpts`/`firstModelPreview`：把写模型渲染成 mongosh 可重放语句（canonical Extended JSON，保 int64 精度），供失败日志与隔离记录使用；渲染结果**确定性**——`extJSON` 会再过一遍 `encoding/json` 把对象键排序，因为写模型是用 `bson.M`（Go map，每次 marshal 迭代序随机）搭的，不排序则同一个模型每次渲染文本都不同，`first_statement` 无法比对、`quarantineID` 也无法稳定；`Store.RenderFirstModel` 是给 pipeline worker 用的导出口 |
 | `dao/store/identity.go` | `IdentityResolver`：`#account_id`/`#distinct_id` → `#user_id` |
 | `dao/store/indexes.go` | `EnsureIndexes`：user/event/dead_letter/id_mapping 索引 |
-| `dao/store/writemodel.go` | 构建写模型与 dead-letter 模型（`_ts` 防回退）；`DeadLetterModel` 的 `line`/`error` 一律经 `sanitizeForBSON`，并带**确定性 `_id`**（`deadLetterID`：净化后 `line`+`error` 的 SHA-1 → `dl-<hex>`），让重读/重投的死信撞 E11000 被当作良性空操作吸收，而不是追加重复行 |
+| `dao/store/writemodel.go` | 构建写模型与 dead-letter 模型（`_ts` 防回退）；`DeadLetterModel` 的 `line`/`error` 一律经 `sanitizeForBSON`，并带**确定性 `_id`**（`deadLetterID`：净化后 `line`+`error` 的 SHA-1 → `dl-<hex>`），让重读/重投的死信撞 E11000 被当作良性空操作吸收，而不是追加重复行；`quarantineID`（前缀 `q-`，域分隔串不同）给 `Store.isolate` 写的隔离/放弃记录同样的确定性 `_id`，哈希的是集合名+原因类+服务端码+**确定性渲染**的语句，刻意排除 `_ts` 与含墙上时长的 message |
 | `dao/mongo/mongo.go` | `MongoResource` + `ConnectMongo`/`Borrow`/`DatabaseFromClient`/`Close` |
 | `dao/mongo/config.go` | `mongo.Config`（URI + 连接超时）+ `MongoDBFromURI` |
 
@@ -648,6 +648,15 @@ ctx 取消分支不变，仍保留批次等重启后从源头重读。
 每次都带等于每秒往 CloudWatch 灌 500B）、`isolate` 的逐条 Error（字段 `statement`）与落库的 `model` 字段、以及
 `logAbandonedModels`。渲染只发生在失败路径，成功路径每条文档都不付这个代价。
 
+**渲染必须是确定性的**：`extJSON` 之后还过一遍 `sortedJSON`（`encoding/json` 解码再编码，对象键排序、数组序保留、
+关掉 HTML 转义）。原因是写模型用 `bson.M` 搭——Go map 每次 marshal 的迭代序都是随机的，所以不排序时**同一个模型
+每次渲染出的文本都不一样**：同一条坏文档反复失败会被记成"一串不同的文档"，运维没法从 `first_statement` 看出这是
+同一条；落库的 `model` 字段跨次不可 diff；更要紧的是 `quarantineID` 哈希的就是这段渲染，键序一乱，去重就静默失效
+（能编译、单次能过、每次尝试都拿到新 `_id`）。canonical Extended JSON 把每种数值类型都包成
+`{"$numberLong":...}`/`{"$numberDouble":...}` 对象，所以这趟往返只见字符串/对象/数组/布尔，不会引入 float64 精度
+损失；仍然设了 `UseNumber`，万一出现裸数字也原样带过。`TestRenderWriteModel_DeterministicAcrossCalls` 用 6 键文档
+渲染 200 次比对钉住它（6 键有 720 种排列，不排序几乎立刻就会红），变异验证过：跳过 `sortedJSON` 第一次比对即失败。
+
 #### 7.2.2 file 一次性导入的函数调用链（v1.6.0）
 
 `function=file` 与 `function=upload` 同核（同一 `Engine.Run` → `process.Uploader`），
@@ -795,9 +804,20 @@ deleted-but-open 文件堆积撑满 overlay（rocket-nano EKS 实测 ~5GB/h）�
    且转发路径沿用第 4 项的规则（只在 `out<-line` 成功后推进）。
    ⚠️ 只修到"不再重复发、不再切碎行"：超 `maxLineBytes` 的行**仍会卡住该文件**（B10 未闭，需要"跳过超长行
    转 dead_letter 并推进 offset"，本次未做）。
+   ⚠️ 已知代价（实测，非推测）：`*lastSize` 现在停在半行**之前**，于是 `tailFileHybridEvent` 的停滞判据
+   `fi.Size() > *lastSize` 对"以半行结尾且不再增长"的文件永远成立，`tailFileHybrid` 会以约 1.5–2 次/秒在
+   Phase 1↔Phase 2 之间空转，每轮新建并销毁一个 `hpcloud/tail` 对象。**不是泄漏**：实测 goroutine 6 次采样
+   恒为 9、fd 正常释放、不重复不丢数据，那条 `hybrid fallback` 是 Debug 级、生产 info 级下不可见；触发条件是
+   生产方在半行处停笔（崩溃/被 kill），且被 emptyDir 约 15 分钟留存封顶。修复前之所以安静，正是因为它把偏移量
+   提交到了碎片后面——也就是靠损坏数据换来的。要彻底消除需让停滞判据认得"上一轮 drain 消费 0 字节"，本次未做。
 
 回归：`backpressure_test.go`（F1/F2 三模式）、`lifecycle_test.go`（C/D），`-race -count=5` 全绿；
-第 5 项由 `lineboundary_repro_test.go` 钉住（先以"故意红"提交复现、修复后转绿，断言值即契约）。
+第 5 项由 `lineboundary_repro_test.go` 钉住（先以"故意红"提交复现、修复后转绿，断言值即契约），其中
+`drainByPoll` 是直接调、`readFollowFile` 是当长跑 poll reader 驱动；**生产默认的 hybrid 路径**（Phase 1 与
+Phase 2 互相交接 `*lastSize`，两半各自的单元测试都看不见交接处的错配）由 `hybrid_lineboundary_test.go`
+走导出的 `Run` 端面到端钉住，并附一条 churn 不累积的守卫（沿用 D4 的 `baseGo+5` 判据，但不设 Linux 门槛）。
+两处修复都做过变异验证：让 `split` 重新吐出未换行结尾的尾巴 → 3 个测试红；把 `drainByPoll` 改回"先
+`return scanner.Err()` 后更新 `*lastSize`" → `TestReproBug2` 红；两条 hybrid 测试同样被第一个变异杀掉。
 
 ### 8.3 identity 解析与 `id_counter` 冷启动竞争修复（`internal/dao/store`）
 
@@ -877,6 +897,9 @@ HTTP 面接的是请求体（文件在服务端本地无意义），daemon 的�
     重导**收敛**——不再"每跑一遍按坏行数追加"。每次出现仍计入返回的 `DeadLetters` 计数器（在**解析**时刻
     自增，不是写入时刻），所以运维盯的速率信号一条不少，只是库里不再重复存同一行。代价：两次**真正独立**
     发生的字节相同坏行会并成一条记录，且留下的是**首次**的 `_ts`。
+    同一个集合里还有另一类记录——`Store.isolate` 写的隔离（`total_quarantined`）与放弃
+    （`total_abandoned`）文档，它们同样带确定性 `_id`（`quarantineID`，前缀 `q-`），所以批次被重投时也收敛；
+    两类记录靠前缀即可区分。
 
   代价（重读文件 + 空写 + 上述累加型操作的重放风险）换来的是零状态、零新集合、零恢复逻辑。
 
