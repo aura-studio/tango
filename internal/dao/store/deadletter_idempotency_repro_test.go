@@ -1,25 +1,26 @@
 package store
 
-// REPRODUCTION-ONLY TEST. Expected to FAIL against the current implementation.
+// REGRESSION TEST — landed intentionally red at 177b7fd, green from d527267.
 //
-// tailFileHybrid justifies re-reading a whole file from offset 0 — which it does
-// whenever os.Stat fails or the inode changes (tailer.go:735 and :741) — with
-// this comment at tailer.go:625-626:
+// tailFileHybrid re-reads a whole file from offset 0 whenever os.Stat fails or the
+// inode changes, and justifies that with a comment claiming re-reading is
+// acceptable at-least-once because "the write models dedup events by #uuid".
 //
-//	"Re-reading the same content on a later restart is acceptable
-//	 (at-least-once): the write models dedup events by #uuid."
+// That reasoning only covered events. DeadLetterModel was a bare
+// mongo.NewInsertOneModel() with no dedup key and no _ts guard, so every re-read of
+// a line that failed to parse appended another dead letter. The same applied to the
+// pipeline worker's outer retry loop, which re-submits the full original batch even
+// though bulkWriteRetried narrowed models internally ("models = retry"): event and
+// user are idempotent so that was harmless, dead_letter was not.
 //
-// That reasoning only covers events. DeadLetterModel (writemodel.go) is a bare
-// mongo.NewInsertOneModel() with no dedup key and no _ts guard, so every re-read
-// of a line that fails to parse appends another dead letter. The same applies to
-// the pipeline worker's outer retry loop, which re-submits the full original
-// batch even though bulkWriteRetried narrowed models internally
-// (store.go, "models = retry"): event/user are idempotent so that is harmless,
-// dead_letter is not.
-//
-// So the at-least-once argument is false for exactly the collection that
+// So the at-least-once argument was false for exactly the collection that
 // at-least-once is supposed to protect. This test pins the property the comment
-// claims, and fails until dead letters carry a dedup key.
+// claimed; DeadLetterModel now carries a deterministic _id (deadLetterID) and the
+// tailer comment was corrected to say what makes the claim hold.
+//
+// The two dead_letter writers that are NOT DeadLetterModel — quarantine and
+// GiveUp's isolate — had the same hole and are covered separately in
+// quarantine_idempotency_test.go.
 
 import (
 	"context"

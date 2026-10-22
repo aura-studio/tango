@@ -1,16 +1,27 @@
 package tailer
 
-// REPRODUCTION-ONLY TESTS. Every test in this file is expected to FAIL against
-// the current implementation. They pin three real defects in how the tailer
-// tracks line boundaries; the fix lands in a following commit, at which point
-// these go green and the "want" values below become the contract.
+// REGRESSION TESTS — landed intentionally red, now green.
+//
+// These were committed at 177b7fd as reproduction-only, expected to FAIL, pinning
+// three real defects in how the tailer tracks line boundaries. d527267 fixed the
+// code (lineScanner plus the offset-commit order in drainByPoll) without touching
+// this file, so the "want" values below are now the contract. Do not relax them to
+// make a failure go away: each was measured red against the pre-fix implementation,
+// and re-mutating the fix — emitting the unterminated tail, or returning
+// scanner.Err() before committing *lastSize — turns the corresponding test red
+// again.
+//
+// Coverage split: these drive the two polling read paths in isolation
+// (drainByPoll directly, readFollowFile as the long-running poll reader).
+// hybrid_lineboundary_test.go covers the production default, where the two
+// mechanisms hand *lastSize to each other.
 //
 // Why these matter: they are the origin of the routine parse errors seen in
 // production (one shard logged 602 against 145,912,291 lines, ~1 in 242,379).
 // Fleet-wide over 8 days, 781 minutes reported a non-zero interval_parse_err and
 // 780 of them reported an EVEN count — almost always exactly 2. One physical log
 // line being emitted as two fragments explains that pairing exactly. None of this
-// is logged: the split is silent, which is why the tailer emitted zero warnings
+// was logged: the split is silent, which is why the tailer emitted zero warnings
 // across 30 days and ~13 pods while still producing bad lines.
 //
 // A fragment split at an arbitrary byte offset can also land in the middle of a
