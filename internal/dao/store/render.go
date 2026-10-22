@@ -1,7 +1,9 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -34,6 +36,11 @@ import (
 // preview needs previewForLog (single line) while a stored field needs
 // sanitizeForBSON. Rendering happens only on failure paths, never per document
 // on the success path.
+//
+// Rendering IS deterministic: the same model always produces the same text (see
+// extJSON for why that needs an explicit guarantee). Store.quarantineID hashes
+// the rendering to give an isolated document a stable _id, so this is a
+// correctness property, not a nicety.
 func renderWriteModel(collName string, m mongo.WriteModel) string {
 	if m == nil {
 		return "db." + collName + ".<nil model>"
@@ -69,6 +76,22 @@ func renderWriteModel(collName string, m mongo.WriteModel) string {
 // renders as null and a marshalling failure degrades to a placeholder rather
 // than propagating: this runs on error paths, and a renderer that can itself
 // fail would defeat the purpose.
+//
+// The result is then re-marshalled with object keys SORTED, because the write
+// models are built from bson.M — a Go map, whose iteration order is randomised on
+// every marshal. Without this the SAME model renders with a different key order on
+// each call, which breaks three things at once: two identical failures log two
+// different first_statement values so an operator cannot tell one recurring
+// document from a stream of distinct ones; the stored "model" field is not
+// diffable across occurrences; and any hash of the rendering (quarantineID) is
+// not stable, so the deduplication it exists to provide silently does not happen.
+//
+// Canonical Extended JSON wraps every numeric type in an object
+// ({"$numberLong":"..."}, {"$numberDouble":"..."}, {"$numberInt":"..."}), so the
+// round trip sees only strings, objects, arrays and booleans — there is no float64
+// to lose the int64 precision the canonical mode was chosen to preserve.
+// UseNumber is set regardless, so a bare number would be carried through verbatim
+// rather than reformatted if one ever appeared.
 func extJSON(v any) string {
 	if v == nil {
 		return "null"
@@ -77,7 +100,32 @@ func extJSON(v any) string {
 	if err != nil {
 		return fmt.Sprintf("<unrenderable %T: %v>", v, err)
 	}
-	return string(b)
+	return sortedJSON(string(b))
+}
+
+// sortedJSON re-marshalls a JSON document so that object keys come out in sorted
+// order, making equal documents always produce equal text. Array order is
+// preserved — it is meaningful (an $or list, arrayFilters) — while key order is
+// not. HTML escaping is disabled so that a log line containing < or & stays
+// readable in the rendered statement instead of turning into \u003c.
+//
+// It returns the input unchanged if it cannot be parsed. That cannot happen for
+// the output of MarshalExtJSON, but a renderer used on error paths must not be
+// able to fail.
+func sortedJSON(s string) string {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return s
+	}
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return s
+	}
+	return strings.TrimRight(buf.String(), "\n")
 }
 
 // writeOpts renders the trailing options argument of an update/replace/delete

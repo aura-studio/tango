@@ -286,3 +286,65 @@ func TestRenderWriteModel_HugeDocumentIsBounded(t *testing.T) {
 		t.Errorf("clipped stored model is %d bytes, want <= %d", len(clipped), quarantineModelBytes+len(truncatedMarker))
 	}
 }
+
+// TestRenderWriteModel_DeterministicAcrossCalls pins that rendering is a function
+// of the model alone. The write models are built from bson.M — a Go map, whose
+// iteration order is randomised on every marshal — so without the key-sorting pass
+// in extJSON the same model renders differently on each call. That is not
+// cosmetic: Store.quarantineID hashes the rendering to derive a stable _id, so a
+// nondeterministic render silently defeats the deduplication of isolated
+// documents, and an operator comparing two first_statement log values cannot tell
+// one recurring document from a stream of distinct ones.
+func TestRenderWriteModel_DeterministicAcrossCalls(t *testing.T) {
+	// Enough keys that random map ordering would show up almost immediately:
+	// 6 keys have 720 permutations, so an unsorted render differs from the first
+	// one with probability 719/720 per call.
+	model := EventWriteModel("track", "det-1", bson.M{
+		"#uuid":       "det-1",
+		"#event_name": "login",
+		"a":           "1",
+		"b":           "2",
+		"c":           "3",
+		"d":           "4",
+	})
+	first := renderWriteModel("event", model)
+	for i := 0; i < 200; i++ {
+		if got := renderWriteModel("event", model); got != first {
+			t.Fatalf("render call #%d differs from the first one for the same model:\n  first: %s\n  #%d:   %s",
+				i, first, i, got)
+		}
+	}
+	// Keys must actually be sorted, not merely stable by accident. Scoped to the
+	// $setOnInsert object: the rendered statement is a mongosh call whose FILTER
+	// argument comes first and also contains "#uuid", so searching the whole
+	// string would compare a key in one argument against a key in another.
+	inner := first[strings.Index(first, `"$setOnInsert":`):]
+	for _, pair := range [][2]string{
+		{`"#event_name"`, `"#uuid"`},
+		{`"#uuid"`, `"_ts"`},
+		{`"a"`, `"b"`},
+		{`"b"`, `"c"`},
+		{`"c"`, `"d"`},
+	} {
+		i, j := strings.Index(inner, pair[0]), strings.Index(inner, pair[1])
+		if i < 0 || j < 0 {
+			t.Fatalf("render missing %s or %s: %s", pair[0], pair[1], first)
+		}
+		if i > j {
+			t.Errorf("%s appears after %s; object keys must be sorted: %s", pair[0], pair[1], first)
+		}
+	}
+	t.Logf("deterministic render: %s", first)
+}
+
+// TestRenderWriteModel_HTMLOrderingNotEscaped checks the readability half of the
+// key-sorting pass: encoding/json escapes <, > and & by default, which would turn
+// a log line containing them into backslash-u noise in the very field an operator
+// reads to diagnose a failure.
+func TestRenderWriteModel_HTMLCharsNotEscaped(t *testing.T) {
+	model := mongo.NewInsertOneModel().SetDocument(bson.M{"line": `a < b && c > d`})
+	got := renderWriteModel("dead_letter", model)
+	if !strings.Contains(got, `a < b && c > d`) {
+		t.Errorf("render = %q, want the raw <, > and & preserved rather than escaped", got)
+	}
+}
