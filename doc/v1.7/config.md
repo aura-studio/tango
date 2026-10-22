@@ -238,7 +238,7 @@ mongodb://user:pass@<cluster-endpoint>:27017/tango?tls=true&tlsCAFile=/path/glob
 
 #### source.file.*（cli `function=file`） → `internal/source/file`
 
-有限一次性的存量文件导入 Source（与 tailer 的常驻追新增相对：把列出的文件从头到尾发完一遍即收尾）。**只接收 `paths` 里的显式文件路径——无 glob、无目录展开、不依赖 tailer**（目录路径 `os.Stat` 检出后记日志跳过，不递归）。扫描语义对齐 tailer（`bufio.Scanner`，64KiB 起始缓冲、上限 `maxLineBytes`，但为 `source/file` 自有实现）。**无 checkpoint/断点**：重跑会全量重导，幂等由写模型按操作类型保证（event 按 `#uuid` `$setOnInsert` upsert 零新增；`user_set`/`user_setOnce`/`user_uniq_append` 收敛；**`user_add`/`user_append` 会重复累加/追加**——`_ts` 守卫只防乱序不防重放，含此类操作的文件不宜盲目重跑；dead_letter 是 append-only 诊断，每次重跑会增长）。字段见 `internal/source/file/config.go`（`RegisterDefaults`/`ApplyDefaults`；无 `Validate`——没有可枚举取值）。
+有限一次性的存量文件导入 Source（与 tailer 的常驻追新增相对：把列出的文件从头到尾发完一遍即收尾）。**只接收 `paths` 里的显式文件路径——无 glob、无目录展开、不依赖 tailer**（目录路径 `os.Stat` 检出后记日志跳过，不递归）。扫描语义对齐 tailer（`bufio.Scanner`，64KiB 起始缓冲、上限 `maxLineBytes`，但为 `source/file` 自有实现）。**无 checkpoint/断点**：重跑会全量重导，幂等由写模型按操作类型保证（event 按 `#uuid` `$setOnInsert` upsert 零新增；`user_set`/`user_setOnce`/`user_uniq_append` 收敛；**`user_add`/`user_append` 会重复累加/追加**——`_ts` 守卫只防乱序不防重放，含此类操作的文件不宜盲目重跑；dead_letter 按内容派生的确定性 `_id` 去重，重跑收敛不增长，但每次出现仍计入返回的 `DeadLetters` 计数）。字段见 `internal/source/file/config.go`（`RegisterDefaults`/`ApplyDefaults`；无 `Validate`——没有可枚举取值）。
 
 | 键 | required/optional | 默认 | 说明 |
 |----|----|----|----|

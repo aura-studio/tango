@@ -180,7 +180,7 @@ tango --config cli.file.max.yaml
   （`$setOnInsert`）重导零新增；`user_set`/`user_setOnce`/`user_uniq_append` 收敛（重导只推进 `$max`
   保护的 `_ts` 元字段）；但 **`user_add`（`$inc`）/`user_append`（`$push`）不幂等**——`_ts` 是摄取时刻、
   `$lte` 守卫只防乱序不防重放，重跑会**重复累加/追加**，含此类操作的存量文件不宜盲目重跑；
-  `dead_letter` 是 append-only 诊断集合，**每重跑一遍会再涨一份**。
+  `dead_letter` 按内容派生的确定性 `_id` 去重，**重跑不会再涨**（每次出现仍计入返回的 `DeadLetters` 计数）。
 - **坏行/坏文件不拖垮整次导入**：单行超 `source.file.maxLineBytes`（默认 10485760 = 10MB，对齐 tailer）
   时记日志（`bufio.ErrTooLong`）并跳过**该文件剩余部分**（超限行不会入库），打不开的文件同样记日志跳过，
   其余匹配文件继续导入。

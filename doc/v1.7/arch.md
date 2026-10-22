@@ -238,6 +238,7 @@ config           -> cfgtree + 各模块（仅用其 RegisterDefaults 注册键�
 | `source/stdin/stdin.go` | `stdin.Source`：从 io.Reader/os.Stdin 逐行扫描成 channel（cli 用） |
 | `source/tailer/tailer.go` | `Tailer`：glob 发现文件、追尾、rescan，输出 line channel（hybrid/poll/event） |
 | `source/tailer/config.go` | `tailer.Config`（含 `logPattern`/`tailMode`/`rescanInterval`/`pollInterval`/`maxLineBytes`/**`maxOpenFDs`** fd 看门狗阈值）+ `TailModeHybrid`/`Poll`/`Event` 常量 |
+| `source/tailer/linescan.go` | `lineScanner`：两条 poll 读路径（`readFollowFile`/`drainByPoll`）专用的 `bufio.Scanner` 包装——**不吐未换行结尾的残行**（`bufio.ScanLines` 在 EOF 会把半行当 token 交出来），并**自计已消费字节** `Consumed()`，让调用方能把文件偏移停在真正的行边界上、且在扫描中途报错时也不丢已转进行的账。event 路径不用它（hpcloud/tail 自己会退回半行）。详见 §8.2 第 5 项 |
 | `source/file/file.go` | `file.Source`：有限一次性导入源——按 `paths` 列出的**显式文件路径**逐个从头到 EOF 把非空行送入 channel（cap 2000）后关闭；**无 glob、无目录展开、不依赖 tailer**（目录路径 stat 检出后记日志跳过，不展开）；scanner 语义对齐 tailer（64KiB 起步、上限 maxLineBytes，但为自有实现）；单文件错误（打不开 / 是目录 / `bufio.ErrTooLong`）记日志跳过、不影响其余文件；无 checkpoint（详见 §9） |
 | `source/file/config.go` | `file.Config`（`paths` []string + `maxLineBytes`，默认 10485760）+ `RegisterDefaults`/`ApplyDefaults`（无 Validate——无可枚举值） |
 | `source/mem/mem.go` | **v1.7** `mem.Source`：channel 背书的中转源——`New(buf)`（buf<=0 取默认 2000）/ `Push(ctx, line)`（单生产者；空行跳过、满则阻塞背压、ctx 取消或已 Close 报错 `ErrClosed`）/ `Close()`（`sync.Once`，关 channel 让 pipeline drain 完收尾）/ `Run(ctx) <-chan string`（不起 goroutine，仅交出接收端）。是 file 的内存对偶，供 backfill 把拉取行喂进上报管线 |
@@ -255,7 +256,7 @@ config           -> cfgtree + 各模块（仅用其 RegisterDefaults 注册键�
 | `dao/store/render.go` | `renderWriteModel`/`extJSON`/`writeOpts`/`firstModelPreview`：把写模型渲染成 mongosh 可重放语句（canonical Extended JSON，保 int64 精度），供失败日志与隔离记录使用；`Store.RenderFirstModel` 是给 pipeline worker 用的导出口 |
 | `dao/store/identity.go` | `IdentityResolver`：`#account_id`/`#distinct_id` → `#user_id` |
 | `dao/store/indexes.go` | `EnsureIndexes`：user/event/dead_letter/id_mapping 索引 |
-| `dao/store/writemodel.go` | 构建写模型与 dead-letter 模型（`_ts` 防回退）；`DeadLetterModel` 的 `line`/`error` 一律经 `sanitizeForBSON` |
+| `dao/store/writemodel.go` | 构建写模型与 dead-letter 模型（`_ts` 防回退）；`DeadLetterModel` 的 `line`/`error` 一律经 `sanitizeForBSON`，并带**确定性 `_id`**（`deadLetterID`：净化后 `line`+`error` 的 SHA-1 → `dl-<hex>`），让重读/重投的死信撞 E11000 被当作良性空操作吸收，而不是追加重复行 |
 | `dao/mongo/mongo.go` | `MongoResource` + `ConnectMongo`/`Borrow`/`DatabaseFromClient`/`Close` |
 | `dao/mongo/config.go` | `mongo.Config`（URI + 连接超时）+ `MongoDBFromURI` |
 
@@ -766,9 +767,9 @@ deleted-but-open 文件堆积撑满 overlay（rocket-nano EKS 实测 ~5GB/h）�
 > 泄漏，且 Windows 测不出（deleted-but-open 是 Linux 语义），只有 Linux 容器的 `TestReap_C2`/`TestFD_D2/D3`
 > 与 E/G soak 能抓到。
 
-### 8.2 `-race` 与背压抓出的四个并发 bug（均已修）
+### 8.2 `tailer.go` 的五个真实缺陷（均已修）
 
-release gate 的 `-race` + 背压用例抓出并修了四个真实并发缺陷（同在 `tailer.go`）：
+前四个由 release gate 的 `-race` + 背压用例抓出；第五个是从生产数据反推出来的（详见该条）。
 
 1. **`tt.Tell()` 数据竞争**（hybrid）：原用 `hpcloud/tail.Tell()` 跟踪偏移，它无锁读 `tail.file`/`tail.reader`
    与库内部 reopen 竞争 → 改为**按字节自计** `lastSize`（每消费一行 +len+1），不再碰库内部状态。
@@ -779,8 +780,24 @@ release gate 的 `-race` + 背压用例抓出并修了四个真实并发缺陷�
    让库 goroutine 观察到 kill 后退出。
 4. **hybrid 背压丢行**：`lastSize` 在"从库取到行"时就前移，stall→poll 切换会跳过手里那条未转发的行 →
    改为**只在 `out<-line` 成功后**前移 `lastSize`，ctx 取消时不前移，让 poll 兜底重读。
+5. **poll 两条读路径在任意字节处切行**（`readFollowFile` / `drainByPoll`）：两处都用 `bufio.ScanLines`，
+   它在 EOF 会把**没有换行结尾的尾巴也当 token 交出来**。追尾进程正好撞上写入方半行时，就先转发半条记录，
+   再把偏移量提交到它后面——写入方补完这行后，剩下的部分被当成**第二行**单独发出去。**一条物理行变成两条
+   都解析不了的碎片**，且全程无任何日志（所以 30 天、~13 pod 零告警仍在产坏行）。这不是推测：全网 8 天里
+   781 个含解析错误的分钟，**780 个是偶数条（几乎总是恰好 2 条）**，只有 1 个奇数（那是卡死那分钟）。
+   `tailer.go` 里那句"Seek back to the start of that partial line"的注释描述的是代码从来没有过的行为——
+   它下面跟的是 `f.Seek(0, io.SeekCurrent)`，一个只查位置的空操作。
+   同一处还有第二个缺陷：`drainByPoll` **先 `return scanner.Err()`、后更新 `*lastSize`**，所以扫描中途失败
+   （现实触发是超 `maxLineBytes` 的行引发 `bufio.ErrTooLong`）时，已经转发出去的行的账全丢，调用方拿着旧偏移
+   重读并**把它们再发一遍**——正是 `doc/v1.5/todo.md` B10 描述的形状。
+   **修**：换成 `linescan.go` 的 `lineScanner`——扣住未换行结尾的尾巴不吐，并自计已消费字节，于是
+   `readFollowFile` 能把 fd 退回真正的行边界（`rewindToConsumed`）、`drainByPoll` 能**先记账再返回错误**，
+   且转发路径沿用第 4 项的规则（只在 `out<-line` 成功后推进）。
+   ⚠️ 只修到"不再重复发、不再切碎行"：超 `maxLineBytes` 的行**仍会卡住该文件**（B10 未闭，需要"跳过超长行
+   转 dead_letter 并推进 offset"，本次未做）。
 
-回归：`backpressure_test.go`（F1/F2 三模式）、`lifecycle_test.go`（C/D），`-race -count=5` 全绿。
+回归：`backpressure_test.go`（F1/F2 三模式）、`lifecycle_test.go`（C/D），`-race -count=5` 全绿；
+第 5 项由 `lineboundary_repro_test.go` 钉住（先以"故意红"提交复现、修复后转绿，断言值即契约）。
 
 ### 8.3 identity 解析与 `id_counter` 冷启动竞争修复（`internal/dao/store`）
 
@@ -856,7 +873,10 @@ HTTP 面接的是请求体（文件在服务端本地无意义），daemon 的�
   - **user_add（`$inc`）/ user_append（`$push`）不幂等**：`_ts` 是 parser 摄取时刻的纳秒（不是事件时间），
     重导行永远带着更新的 `_ts`、`$lte` 守卫只防乱序不防重放——重跑会**重复累加 / 重复追加**。
     含此类操作的存量文件**不宜盲目重跑**；
-  - dead_letter：append-only 诊断集合，**每跑一遍按坏行数追加**（这是预期行为，不是泄漏）。
+  - dead_letter：按 `DeadLetterModel` 的确定性 `_id`（净化后 `line`+`error` 的 SHA-1，前缀 `dl-`）去重，
+    重导**收敛**——不再"每跑一遍按坏行数追加"。每次出现仍计入返回的 `DeadLetters` 计数器（在**解析**时刻
+    自增，不是写入时刻），所以运维盯的速率信号一条不少，只是库里不再重复存同一行。代价：两次**真正独立**
+    发生的字节相同坏行会并成一条记录，且留下的是**首次**的 `_ts`。
 
   代价（重读文件 + 空写 + 上述累加型操作的重放风险）换来的是零状态、零新集合、零恢复逻辑。
 

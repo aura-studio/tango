@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -268,15 +270,46 @@ func EventWriteModel(typ, uuid string, doc bson.M) mongo.WriteModel {
 // writable, so the bad data is preserved for inspection instead of wedging the
 // pipeline. Control bytes are rendered as readable `\xNN` escapes rather than
 // dropped, so the diagnosis survives.
+//
+// The document also carries a deterministic _id derived from the sanitized
+// content. Unlike the event and user models, a dead letter has no producer-
+// assigned identity to dedup on, so it used to be the one write model that
+// re-delivery could duplicate — and re-delivery is normal here, not exceptional:
+// the tailer resets its offset and re-reads a file on rotation or a scan error,
+// and the pipeline worker re-submits a whole batch after a transient failure.
+// With a stable _id the second arrival hits E11000, which bulkWriteRetried
+// already treats as a benign no-op (isOnlyDuplicateKey / classifyBulkWriteError),
+// so no store change was needed.
+//
+// The trade-off is deliberate: two genuinely separate occurrences of a
+// byte-identical bad line collapse into one dead_letter document. That is
+// acceptable because the dead_letters counter is incremented at parse time, not
+// at write time, so the RATE signal an operator alerts on still counts both —
+// only the stored copy is deduplicated.
 func DeadLetterModel(line string, parseErr error) mongo.WriteModel {
 	errMsg := ""
 	if parseErr != nil {
 		errMsg = parseErr.Error()
 	}
+	safeLine := sanitizeForBSON(line, maxDeadLetterLineBytes)
+	safeErr := sanitizeForBSON(errMsg, logPreviewBytes)
 	doc := bson.M{
+		"_id":   deadLetterID(safeLine, safeErr),
 		"_ts":   time.Now().UnixNano(),
-		"line":  sanitizeForBSON(line, maxDeadLetterLineBytes),
-		"error": sanitizeForBSON(errMsg, logPreviewBytes),
+		"line":  safeLine,
+		"error": safeErr,
 	}
 	return mongo.NewInsertOneModel().SetDocument(doc)
+}
+
+// deadLetterID derives a stable _id from already-sanitized content, so the same
+// bad line produces the same identifier no matter when or how many times it is
+// read. Hashing the sanitized form rather than the raw line is what makes this
+// work: sanitizing is deterministic, so equal inputs still hash equal, and it
+// keeps the identifier free of the bytes that made the document unwritable in
+// the first place. The domain-separation prefix follows the existing convention
+// in internal/backfill/rowdecode.go's synthUserUUID.
+func deadLetterID(safeLine, safeErr string) string {
+	h := sha1.Sum([]byte("tango/dead_letter\x00" + safeLine + "\x00" + safeErr))
+	return "dl-" + hex.EncodeToString(h[:])
 }

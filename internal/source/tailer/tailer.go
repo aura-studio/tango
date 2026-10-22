@@ -3,7 +3,6 @@
 package tailer
 
 import (
-	"bufio"
 	"context"
 	"io"
 	"io/fs"
@@ -435,13 +434,22 @@ func (t *Tailer) readFollowFile(ctx context.Context, path string, out chan<- str
 		return err
 	}
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), t.maxLineSize)
+	// startOff is f's offset when the current scanner was created. bufio.Scanner
+	// reads ahead of what it hands out, so once a scan ends f sits past the last
+	// complete line; rewindToConsumed uses startOff plus the bytes actually
+	// consumed to put it back on a line boundary.
+	var startOff int64
 
 	for {
-		// Read all available complete lines.
-		for scanner.Scan() {
-			line := scanner.Text()
+		// Read all available complete lines. An unterminated trailing line is not
+		// one of them: lineScanner withholds it and the rewind below leaves f in
+		// front of it, so the next pass reads it whole once the writer finishes
+		// it. Emitting the fragment here — which is what the previous code did,
+		// despite a comment claiming it seeked back — is what split one physical
+		// line into two unparseable ones.
+		ls := newLineScanner(f, t.maxLineSize)
+		for ls.Scan() {
+			line := ls.Text()
 			if len(line) == 0 {
 				continue
 			}
@@ -451,7 +459,13 @@ func (t *Tailer) readFollowFile(ctx context.Context, path string, out chan<- str
 				return ctx.Err()
 			}
 		}
-		if err := scanner.Err(); err != nil {
+		if err := rewindToConsumed(f, startOff, ls.Consumed()); err != nil {
+			return err
+		}
+		startOff += ls.Consumed()
+		// Rewind first, then report: a scan that failed partway must not leave
+		// the offset behind the lines already forwarded.
+		if err := ls.Err(); err != nil {
 			return err
 		}
 
@@ -475,37 +489,43 @@ func (t *Tailer) readFollowFile(ctx context.Context, path string, out chan<- str
 		case <-time.After(t.pollInterval):
 		}
 
-		// After the sleep the file position is still at the last read
-		// offset. Create a fresh scanner that reuses the underlying fd
-		// so it picks up any bytes appended since the last EOF.
-		//
-		// bufio.Scanner is not resumable after Scan returns false, so we
-		// must create a new one. The file offset in f is preserved.
-		//
-		// We also need to handle the case where the writer wrote a
-		// partial line (no trailing newline yet). Seek back to the start
-		// of that partial line so the next scanner picks it up as a
-		// complete line once more data is written.
-		pos, err := f.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return err
-		}
+		// bufio.Scanner is not resumable after Scan returns false, so the next
+		// iteration builds a fresh one over the same fd, whose offset the rewind
+		// above left exactly on a line boundary.
 
-		// Check if the file was truncated (size shrank).
+		// Check if the file was truncated (size shrank below our position).
 		fi, err := f.Stat()
 		if err != nil {
 			return err
 		}
-		if fi.Size() < pos {
+		if fi.Size() < startOff {
 			// File was truncated; rewind to beginning.
 			if _, err := f.Seek(0, io.SeekStart); err != nil {
 				return err
 			}
+			startOff = 0
 		}
-
-		scanner = bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 0, 64*1024), t.maxLineSize)
 	}
+}
+
+// rewindToConsumed moves f back to startOff+consumed, undoing bufio.Scanner's
+// read-ahead. The scanner fills its buffer in chunks, so f's physical offset
+// ends up past the last line the caller actually took — by at least the
+// unterminated tail that lineScanner withheld, and by more if the scan stopped
+// early with an error. Leaving the offset where the reads stopped would make the
+// next scanner resume in the middle of a line.
+func rewindToConsumed(f *os.File, startOff, consumed int64) error {
+	pos, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	// consumed can never exceed the bytes read, so back is never negative.
+	if back := pos - startOff - consumed; back > 0 {
+		if _, err := f.Seek(-back, io.SeekCurrent); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -623,7 +643,10 @@ func (t *Tailer) tailFileHybrid(ctx context.Context, path string, out chan<- str
 	// it advances only after a line is forwarded (see tailFileHybridEvent) and is
 	// reset to 0 on rotation/truncation so the replacement inode is likewise read
 	// from the start. Re-reading the same content on a later restart is acceptable
-	// (at-least-once): the write models dedup events by #uuid.
+	// (at-least-once) because every write model dedups: events by #uuid, users by
+	// the _ts guard, dead letters by a content-derived _id. The dead-letter key is
+	// what makes that claim hold for the whole pipeline — without it, a re-read
+	// appended a duplicate diagnostic row for every line that failed to parse.
 	var lastSize int64
 
 	for {
@@ -749,8 +772,10 @@ func (t *Tailer) tailFileHybridEvent(ctx context.Context, path string, out chan<
 	}
 }
 
-// drainByPoll reads data from *lastSize to the current EOF using the
-// polling reader, then updates *lastSize.
+// drainByPoll reads data from *lastSize up to the last newline-terminated line,
+// forwarding each one and advancing *lastSize past it. An unterminated tail is
+// left alone: *lastSize stops in front of it so a later pass picks the line up
+// whole, once the writer has finished it.
 func (t *Tailer) drainByPoll(ctx context.Context, path string, out chan<- string, lastSize *int64) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -762,31 +787,35 @@ func (t *Tailer) drainByPoll(ctx context.Context, path string, out chan<- string
 		return err
 	}
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), t.maxLineSize)
-
-	for scanner.Scan() {
-		line := scanner.Text()
+	ls := newLineScanner(f, t.maxLineSize)
+	// delivered mirrors the event path's rule (see tailFileHybridEvent): advance
+	// the offset only once a line is safely forwarded. ls.Consumed() counts a
+	// token as soon as the split function produces it, which is BEFORE the send
+	// below, so using it directly on the ctx-cancelled path would skip the line
+	// we were preempted on.
+	var delivered int64
+	for ls.Scan() {
+		line := ls.Text()
 		if len(line) == 0 {
+			delivered = ls.Consumed() // blank: nothing to forward, but it is consumed
 			continue
 		}
 		select {
 		case out <- line:
+			delivered = ls.Consumed()
 		case <-ctx.Done():
+			*lastSize += delivered
 			return ctx.Err()
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-
-	// Update position to current offset.
-	pos, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	*lastSize = pos
-	return nil
+	// Advance BEFORE checking the error. This function used to return
+	// scanner.Err() first and only update *lastSize afterwards, so a scan that
+	// failed partway — bufio.ErrTooLong on a line over maxLineSize is the
+	// realistic trigger — left the offset behind the lines already forwarded.
+	// The caller then looped back with the stale offset and re-read them, which
+	// for dead letters meant duplicate rows (see DeadLetterModel's stable _id).
+	*lastSize += ls.Consumed()
+	return ls.Err()
 }
 
 // ---------------------------------------------------------------------------

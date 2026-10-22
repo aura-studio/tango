@@ -62,7 +62,8 @@ func rawDoc(t *testing.T, db *mongo.Database, coll string, filter bson.M) bson.R
 
 // TestFileEngineImportIsIdempotent feeds the engine's File face from on-disk
 // files and re-imports the same files: counts and documents must come out
-// identical (events upsert by #uuid, user fields are _ts-guarded).
+// identical (events upsert by #uuid, user fields are _ts-guarded, dead letters
+// dedup on a content-derived _id).
 func TestFileEngineImportIsIdempotent(t *testing.T) {
 	daoCfg, db, cleanup := freshDB(t)
 	defer cleanup()
@@ -97,9 +98,19 @@ func TestFileEngineImportIsIdempotent(t *testing.T) {
 	eventBefore := rawDoc(t, db, "event", bson.M{"#uuid": "it-e1"})
 	userBefore := rawDoc(t, db, "user", bson.M{})
 
-	// Re-import: full re-read (no checkpoint). Events and users must not
-	// change; dead letters are append-only diagnostics (an invalid line has no
-	// uuid to converge on), so the re-run adds one more.
+	// Re-import: full re-read (no checkpoint). Nothing may change — the import is
+	// now idempotent across all three collections.
+	//
+	// Dead letters used to be the documented exception here ("append-only
+	// diagnostics: an invalid line has no uuid to converge on, so the re-run adds
+	// one more"). That was a statement of a missing dedup key, not a wanted
+	// behaviour, and DeadLetterModel now supplies one: a deterministic _id derived
+	// from the sanitized line and error. The second arrival conflicts on _id, and
+	// E11000 is already absorbed as a benign no-op, so the re-run converges.
+	//
+	// What must NOT change is the rate signal: res.DeadLetters is incremented at
+	// parse time, so every occurrence is still reported per invocation even though
+	// only one copy is stored. Both halves are pinned below.
 	res2, err := eng.File(ctx, &api.FileConfig{Paths: paths})
 	if err != nil {
 		t.Fatalf("File re-run: %v", err)
@@ -107,14 +118,18 @@ func TestFileEngineImportIsIdempotent(t *testing.T) {
 	if res2.Lines != 6 {
 		t.Fatalf("re-run lines = %d, want 6 (no checkpoint, full re-read)", res2.Lines)
 	}
+	if res2.DeadLetters != 1 {
+		t.Errorf("re-run res.DeadLetters = %d, want 1: the counter must still report every "+
+			"occurrence even though the stored copy deduplicates", res2.DeadLetters)
+	}
 	if got := count(t, db, "event"); got != 4 {
 		t.Errorf("events after re-import = %d, want 4 (uuid upsert idempotency)", got)
 	}
 	if got := count(t, db, "user"); got != 1 {
 		t.Errorf("users after re-import = %d, want 1 (_ts-guarded idempotency)", got)
 	}
-	if got := count(t, db, "dead_letter"); got != 2 {
-		t.Errorf("dead_letters after re-import = %d, want 2 (append-only diagnostics)", got)
+	if got := count(t, db, "dead_letter"); got != 1 {
+		t.Errorf("dead_letters after re-import = %d, want 1 (deterministic _id dedups the re-read)", got)
 	}
 
 	// Events are $setOnInsert-only: byte-identical across re-imports.
@@ -178,9 +193,14 @@ func TestFileCliRoleAcrossModes(t *testing.T) {
 				if got := count(t, db, "user"); got != 1 {
 					t.Errorf("run %d: users = %d, want 1", run, got)
 				}
-				// Dead letters append per run (no uuid to converge on).
-				if got := count(t, db, "dead_letter"); got != int64(run) {
-					t.Errorf("run %d: dead_letters = %d, want %d", run, got, run)
+				// Dead letters converge across runs rather than appending: the
+				// deterministic _id makes run 2's copy of the same bad line a
+				// benign E11000 no-op. The per-run counter still reports it.
+				if got := count(t, db, "dead_letter"); got != 1 {
+					t.Errorf("run %d: dead_letters = %d, want 1 (deterministic _id dedups the re-import)", run, got)
+				}
+				if res.DeadLetters != 1 {
+					t.Errorf("run %d: res.DeadLetters = %d, want 1 (every occurrence is still counted)", run, res.DeadLetters)
 				}
 			}
 		})
