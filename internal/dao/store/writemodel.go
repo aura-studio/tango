@@ -3,6 +3,7 @@ package store
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"strconv"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -312,4 +313,46 @@ func DeadLetterModel(line string, parseErr error) mongo.WriteModel {
 func deadLetterID(safeLine, safeErr string) string {
 	h := sha1.Sum([]byte("tango/dead_letter\x00" + safeLine + "\x00" + safeErr))
 	return "dl-" + hex.EncodeToString(h[:])
+}
+
+// quarantineID derives a stable _id for the records Store.isolate writes when a
+// document was permanently rejected by the server or abandoned after the
+// backpressure budget ran out. Those records used to be the last non-idempotent
+// write in the pipeline: isolate built a bare bson.M with no _id, so every
+// re-submission of the same batch appended another copy of the same diagnosis.
+// Re-submission is normal, not exceptional — the pipeline worker retries the full
+// original batch after bulkWriteRetried narrowed it internally, and the tailer
+// re-reads a file from the head on rotation.
+//
+// The identity is deliberately narrower than the stored document. It covers the
+// rendered statement plus the three fields that say *what kind* of failure this
+// was (collection, reason class, server code) and excludes _ts and
+// _quarantine_message: the message carries the server's or the worker's own error
+// text, which for an abandonment embeds a wall-clock duration ("batch stuck for
+// 3m4s"), so hashing it would defeat deduplication for exactly the case that
+// recurs. Reason, by contrast, is one of two constants (see quarantine and
+// GiveUp), so keeping it in the hash means a document that was first rejected and
+// later abandoned still leaves two distinguishable records.
+//
+// The domain-separation prefix differs from deadLetterID's, so a quarantine
+// record can never collide with a parse-error dead letter, and the "q-" / "dl-"
+// _id prefixes keep the two populations tellable apart in the collection itself.
+//
+// This depends on renderWriteModel being deterministic — see extJSON, which sorts
+// object keys precisely because the models are built from bson.M. Hashing an
+// unsorted rendering compiles, passes a single run, and then silently produces a
+// fresh _id per attempt; TestRenderWriteModel_DeterministicAcrossCalls is the gate
+// that keeps this key honest.
+//
+// What still varies is _ts, which the event and user models stamp at construction
+// time. A batch the worker RETAINS and re-submits carries the same model values, so
+// its rendering — and therefore its _id — is stable and converges, which is the
+// duplication this exists to stop. A tailer re-read parses the line afresh and gets
+// a new _ts, so it produces a distinct record; that case is acceptable because an
+// event that the server accepts never reaches quarantine in the first place, and
+// one that it permanently refuses is a fact worth recording per occurrence.
+func quarantineID(collName, reason string, code int, safeStatement string) string {
+	h := sha1.Sum([]byte("tango/quarantine\x00" + collName + "\x00" + reason + "\x00" +
+		strconv.Itoa(code) + "\x00" + safeStatement))
+	return "q-" + hex.EncodeToString(h[:])
 }

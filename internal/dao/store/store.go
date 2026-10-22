@@ -117,8 +117,12 @@ func (s *Store) BulkWriteOrdered(ctx context.Context, coll *mongo.Collection, mo
 //     split — the server applied nothing, so re-submitting each half is safe —
 //     and once irreducible to a single document, quarantined;
 //   - a batch of dead letters that is itself unwinnable is logged and released
-//     rather than split, because dead-letter models are non-idempotent inserts
-//     and re-sinking them into their own collection would duplicate.
+//     rather than split, because re-sinking them into their own collection would
+//     only add second-generation envelopes to the collection that just refused the
+//     originals (see GiveUp). A LONE unwinnable model takes the quarantine branch
+//     above first, whatever the collection: there isolate renders and sanitizes it
+//     into a fresh record under a deterministic _id, which is a form the server
+//     will accept, so the evidence survives rather than being log-only.
 //
 // Connection / failover / write-concern errors carry no permanence signal and
 // are retried, applying backpressure. That backpressure is deliberately bounded
@@ -445,10 +449,15 @@ func (s *Store) quarantine(ctx context.Context, collName string, poison []poison
 // The batch is counted in TotalAbandoned and — EXCEPT when the batch is itself
 // dead letters — isolated into dead_letter on a best-effort basis, so it stays
 // recoverable. A batch that IS dead letters is logged and released without being
-// written anywhere: dead-letter models are non-idempotent inserts, so sinking
-// them into their own collection again would duplicate whatever partially
-// landed. That makes the log line the only surviving record, which is why
-// logAbandonedModels is deliberately not capped the way isolate's logging is.
+// written anywhere. That exception is not about idempotency: dead-letter models
+// carry a deterministic _id (see DeadLetterModel), so re-submitting them cannot
+// duplicate. It is that isolating them would not recover anything either — the
+// record would be a second-generation envelope (a dead_letter document whose
+// "model" field is the mongosh statement of another dead_letter document) stored
+// in the very collection that just refused the original, and that refusal is the
+// usual reason this path runs at all. So the log line is the only surviving
+// record, which is why logAbandonedModels is deliberately not capped the way
+// isolate's logging is.
 //
 // GiveUp never returns an error and never blocks beyond the bounded isolation
 // write. Quarantined and Abandoned count different reasons for the same sink, so
@@ -497,6 +506,13 @@ func (s *Store) GiveUp(ctx context.Context, coll *mongo.Collection, models []mon
 // shutdown and cannot block): if dead_letter itself still rejects it, the error
 // is logged and the documents dropped rather than retried, since the alternative
 // is the infinite stall this whole mechanism exists to remove.
+//
+// The records are idempotent: each carries a content-derived _id (quarantineID),
+// so re-isolating the same document converges on one row instead of appending a
+// copy per attempt, and a duplicate-only result is not treated as a failure. As
+// with DeadLetterModel, the counter passed in still increments once per
+// occurrence, so the rate an operator alerts on is unaffected — only the stored
+// copy deduplicates.
 func (s *Store) isolate(ctx context.Context, collName string, poison []poisonDoc, reason, detailMsg string, counter *atomic.Int64) {
 	docs := make([]any, 0, len(poison))
 	for i, p := range poison {
@@ -516,13 +532,17 @@ func (s *Store) isolate(ctx context.Context, collName string, poison []poisonDoc
 				"statement":  previewForLog(statement, logPreviewBytes),
 			}).Error(detailMsg)
 		}
+		safeStatement := sanitizeForBSON(statement, quarantineModelBytes)
 		docs = append(docs, bson.M{
+			// Deterministic, so a re-submitted batch converges instead of
+			// appending another copy of the same diagnosis: see quarantineID.
+			"_id":                    quarantineID(collName, reason, p.code, safeStatement),
 			"_quarantine_reason":     reason,
 			"_quarantine_collection": collName,
 			"_quarantine_code":       p.code,
 			"_quarantine_message":    sanitizeForBSON(p.message, logPreviewBytes),
 			"_ts":                    time.Now().UnixNano(),
-			"model":                  sanitizeForBSON(statement, quarantineModelBytes),
+			"model":                  safeStatement,
 		})
 	}
 	logOverflow(collName, "rejected documents", len(poison))
@@ -530,7 +550,13 @@ func (s *Store) isolate(ctx context.Context, collName string, poison []poisonDoc
 
 	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	if _, err := s.deadLetter.InsertMany(qctx, docs, options.InsertMany().SetOrdered(false)); err != nil {
+	// Unordered, so one duplicate _id cannot block the rest of the batch, and a
+	// duplicate-only result is not an error: it means this exact document was
+	// already isolated by an earlier attempt at the same batch, which is the
+	// convergence the _id exists to produce. Reporting it as a failure would put
+	// a scary "dropping to avoid wedge" line in the log for a no-op. Anything
+	// beyond duplicates is still a real isolation failure and is logged.
+	if _, err := s.deadLetter.InsertMany(qctx, docs, options.InsertMany().SetOrdered(false)); err != nil && !isOnlyDuplicateKey(err) {
 		logging.WithError(err).WithField("collection", collName).
 			Error("bulk write: failed to isolate document(s) to dead_letter; dropping to avoid wedge")
 	}
